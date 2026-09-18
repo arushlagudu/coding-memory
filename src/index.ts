@@ -4,6 +4,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
+import { extractEntities, containmentScore } from "./scoring.js";
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -46,11 +48,39 @@ server.registerTool(
     }
 
     const memories = data ?? [];
+
+    const memoryIds = memories.map((m) => m.id);
+    const linkedIdsByMemory = new Map<string, Set<string>>();
+
+    if (memoryIds.length > 0) {
+      const idList = memoryIds.join(",");
+      const { data: links, error: linksError } = await supabase
+        .from("memory_links")
+        .select("source_id, target_id")
+        .or(`source_id.in.(${idList}),target_id.in.(${idList})`);
+
+      if (linksError) {
+        throw new Error(`Failed to load memory links: ${linksError.message}`);
+      }
+
+      for (const link of links ?? []) {
+        if (!linkedIdsByMemory.has(link.source_id)) linkedIdsByMemory.set(link.source_id, new Set());
+        if (!linkedIdsByMemory.has(link.target_id)) linkedIdsByMemory.set(link.target_id, new Set());
+        linkedIdsByMemory.get(link.source_id)!.add(link.target_id);
+        linkedIdsByMemory.get(link.target_id)!.add(link.source_id);
+      }
+    }
+
+    const memoriesWithLinks = memories.map((m) => ({
+      ...m,
+      linked_memory_ids: Array.from(linkedIdsByMemory.get(m.id) ?? []),
+    }));
+
     return {
       content: [
         { type: "text", text: `Loaded ${memories.length} memory row(s) for "${project}".` },
       ],
-      structuredContent: { memories },
+      structuredContent: { memories: memoriesWithLinks },
     };
   }
 );
@@ -77,12 +107,52 @@ server.registerTool(
     },
   },
   async ({ project, type, content }) => {
-    const { error } = await supabase
+    const { data: inserted, error } = await supabase
       .from("memories")
-      .insert({ project, type, content });
+      .insert({ project, type, content })
+      .select("id")
+      .single();
 
-    if (error) {
-      throw new Error(`Failed to save memory: ${error.message}`);
+    if (error || !inserted) {
+      throw new Error(`Failed to save memory: ${error?.message ?? "no row returned"}`);
+    }
+
+    const newMemoryId = inserted.id;
+
+    const { data: recentMemories, error: recentError } = await supabase
+      .from("memories")
+      .select("id, content")
+      .eq("project", project)
+      .eq("resolved", false)
+      .neq("id", newMemoryId)
+      .order("created_at", { ascending: false })
+      .limit(50);
+
+    if (recentError) {
+      throw new Error(`Failed to load memories for linking: ${recentError.message}`);
+    }
+
+    const existingMemories = recentMemories ?? [];
+    const existingEntities = existingMemories.map((existing) => extractEntities(existing.content));
+    const newEntities = extractEntities(content);
+
+    const links = existingMemories
+      .map((existing, index) => {
+        const score = containmentScore(newEntities, existingEntities[index]);
+        console.error(`SCORE: [${content}] vs [${existing.content}] = ${score}`);
+        return {
+          source_id: newMemoryId,
+          target_id: existing.id,
+          score,
+        };
+      })
+      .filter((link) => link.score > 0.15);
+
+    if (links.length > 0) {
+      const { error: linkError } = await supabase.from("memory_links").insert(links);
+      if (linkError) {
+        throw new Error(`Failed to save memory links: ${linkError.message}`);
+      }
     }
 
     const saved = true as const;
@@ -153,6 +223,83 @@ server.registerTool(
     return {
       content: [{ type: "text", text: "Fix recorded." }],
       structuredContent: { saved },
+    };
+  }
+);
+
+// --- analyze_codebase ------------------------------------------------------
+
+server.registerTool(
+  "analyze_codebase",
+  {
+    title: "Analyze Codebase",
+    description:
+      "Build a lightweight AST index of a project's .ts/.js files (functions, classes, imports) into a local SQLite database at <project_path>/.coding-memory/ast-index.db.",
+    inputSchema: {
+      project_path: z.string().describe("Absolute or relative path to the project to index"),
+    },
+  },
+  async ({ project_path }) => {
+    const summary = analyzeCodebase(project_path);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Indexed ${summary.files_indexed} file(s): ${summary.functions} function(s), ${summary.classes} class(es).`,
+        },
+      ],
+      structuredContent: summary,
+    };
+  }
+);
+
+// --- get_file_summary --------------------------------------------------------
+
+server.registerTool(
+  "get_file_summary",
+  {
+    title: "Get File Summary",
+    description:
+      "Look up the functions and classes recorded for a file in the project's AST index. Requires analyze_codebase to have been run first.",
+    inputSchema: {
+      project_path: z.string().describe("Path to the project that was indexed"),
+      file_name: z.string().describe("File name or relative path to look up"),
+    },
+  },
+  async ({ project_path, file_name }) => {
+    const summary = getFileSummary(project_path, file_name);
+    return {
+      content: [
+        {
+          type: "text",
+          text: `${summary.file_path}: ${summary.functions.length} function(s), ${summary.classes.length} class(es).`,
+        },
+      ],
+      structuredContent: summary,
+    };
+  }
+);
+
+// --- find_dependencies ----------------------------------------------------
+
+server.registerTool(
+  "find_dependencies",
+  {
+    title: "Find Dependencies",
+    description:
+      "Look up what a file imports, based on the project's AST index. Requires analyze_codebase to have been run first.",
+    inputSchema: {
+      project_path: z.string().describe("Path to the project that was indexed"),
+      file_name: z.string().describe("File name or relative path to look up"),
+    },
+  },
+  async ({ project_path, file_name }) => {
+    const deps = findDependencies(project_path, file_name);
+    return {
+      content: [
+        { type: "text", text: `${deps.file_path} imports ${deps.imports.length} module(s).` },
+      ],
+      structuredContent: deps,
     };
   }
 );
