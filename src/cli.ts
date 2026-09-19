@@ -31,8 +31,45 @@ function usage(): never {
   cm save <project> <type> <content>      (type: decision|rejection|constraint|discovery)
   cm fix <project> <problem> <solution>
   cm analyze <project> <path>
-  cm search <project> <query>`);
+  cm search <project> <query>
+  cm resolve <project> <memory-id>
+  cm delete <project> <memory-id>
+  cm help`);
   process.exit(1);
+}
+
+function cmdHelp() {
+  console.log(`cm — coding memory CLI
+
+  cm start <project>
+      Load all unresolved memories for a project, grouped by type
+      (decisions, constraints, discoveries, rejections), with linked
+      memory ids shown under each entry.
+
+  cm save <project> <type> <content>
+      Save a new memory. <type> is one of: decision, rejection,
+      constraint, discovery. Automatically links to related existing
+      memories.
+
+  cm fix <project> <problem> <solution>
+      Record a problem and its solution for future reference.
+
+  cm analyze <project> <path>
+      Build an AST index (files, functions, classes) for the codebase
+      at <path>.
+
+  cm search <project> <query>
+      Search saved memories and past fixes for a project matching
+      <query>.
+
+  cm resolve <project> <memory-id>
+      Mark a memory as resolved.
+
+  cm delete <project> <memory-id>
+      Delete a memory and any memory_links referencing it.
+
+  cm help
+      Show this help message.`);
 }
 
 function fail(message: string): never {
@@ -170,27 +207,87 @@ async function cmdAnalyze(project: string, path: string) {
 // --- cm search -------------------------------------------------------------
 
 async function cmdSearch(project: string, query: string) {
-  const { data, error } = await supabase
+  const { data: memories, error: memoriesError } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .ilike("content", `%${query}%`);
+
+  if (memoriesError) fail(`Failed to search memories: ${memoriesError.message}`);
+
+  const { data: fixes, error: fixesError } = await supabase
     .from("execution_log")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false)
     .or(`problem.ilike.%${query}%,solution.ilike.%${query}%`);
 
-  if (error) fail(`Failed to search past solutions: ${error.message}`);
+  if (fixesError) fail(`Failed to search past fixes: ${fixesError.message}`);
 
-  const results = data ?? [];
-  if (results.length === 0) {
-    console.log(`No past solutions found for "${query}" in "${project}".`);
+  const memoryResults = memories ?? [];
+  const fixResults = fixes ?? [];
+
+  if (memoryResults.length === 0 && fixResults.length === 0) {
+    console.log("No results found");
     return;
   }
 
-  console.log(`Found ${results.length} result(s) for "${query}":\n`);
-  for (const result of results) {
-    console.log(`  Problem:  ${result.problem}`);
-    console.log(`  Solution: ${result.solution}`);
-    console.log("");
+  console.log(`Memories (${memoryResults.length})`);
+  console.log("-".repeat(11));
+  if (memoryResults.length === 0) {
+    console.log("No results found");
+  } else {
+    for (const memory of memoryResults) {
+      console.log(`  [${memory.id}] (${memory.type}) ${memory.content}`);
+    }
   }
+  console.log("");
+
+  console.log(`Past Fixes (${fixResults.length})`);
+  console.log("-".repeat(14));
+  if (fixResults.length === 0) {
+    console.log("No results found");
+  } else {
+    for (const fix of fixResults) {
+      console.log(`  Problem:  ${fix.problem}`);
+      console.log(`  Solution: ${fix.solution}`);
+      console.log("");
+    }
+  }
+}
+
+// --- cm resolve ------------------------------------------------------------
+
+async function cmdResolve(project: string, memoryId: string) {
+  const { error } = await supabase
+    .from("memories")
+    .update({ resolved: true })
+    .eq("project", project)
+    .eq("id", memoryId);
+
+  if (error) fail(`Failed to resolve memory: ${error.message}`);
+
+  console.log(`Resolved memory [${memoryId}]`);
+}
+
+// --- cm delete -------------------------------------------------------------
+
+async function cmdDelete(project: string, memoryId: string) {
+  const { error: linksError } = await supabase
+    .from("memory_links")
+    .delete()
+    .or(`source_id.eq.${memoryId},target_id.eq.${memoryId}`);
+
+  if (linksError) fail(`Failed to delete memory links: ${linksError.message}`);
+
+  const { error } = await supabase
+    .from("memories")
+    .delete()
+    .eq("project", project)
+    .eq("id", memoryId);
+
+  if (error) fail(`Failed to delete memory: ${error.message}`);
+
+  console.log(`Deleted memory [${memoryId}]`);
 }
 
 // --- main --------------------------------------------------------------
@@ -227,6 +324,22 @@ async function main() {
       const [project, ...rest] = args;
       if (!project || rest.length === 0) usage();
       await cmdSearch(project, rest.join(" "));
+      break;
+    }
+    case "resolve": {
+      const [project, memoryId] = args;
+      if (!project || !memoryId) usage();
+      await cmdResolve(project, memoryId);
+      break;
+    }
+    case "delete": {
+      const [project, memoryId] = args;
+      if (!project || !memoryId) usage();
+      await cmdDelete(project, memoryId);
+      break;
+    }
+    case "help": {
+      cmdHelp();
       break;
     }
     default:
