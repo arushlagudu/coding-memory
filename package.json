@@ -4,6 +4,9 @@
   "description": "",
   "main": "index.js",
   "type": "module",
+  "bin": {
+    "cm": "src/cli.ts"
+  },
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc"
