@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
-import { computeMemoryLinks, decideSaveAction } from "./scoring.js";
+import { computeDecayScore, computeMemoryLinks, decideSaveAction } from "./scoring.js";
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -49,7 +49,14 @@ server.registerTool(
 
     const memories = data ?? [];
 
-    const memoryIds = memories.map((m) => m.id);
+    const scoredMemories = memories
+      .map((memory) => ({
+        ...memory,
+        decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0),
+      }))
+      .sort((a, b) => b.decay_score - a.decay_score);
+
+    const memoryIds = scoredMemories.map((m) => m.id);
     const linkedIdsByMemory = new Map<string, Set<string>>();
 
     if (memoryIds.length > 0) {
@@ -71,10 +78,25 @@ server.registerTool(
       }
     }
 
-    const memoriesWithLinks = memories.map((m) => ({
+    const memoriesWithLinks = scoredMemories.map((m) => ({
       ...m,
       linked_memory_ids: Array.from(linkedIdsByMemory.get(m.id) ?? []),
     }));
+
+    if (scoredMemories.length > 0) {
+      const incrementResults = await Promise.all(
+        scoredMemories.map((memory) =>
+          supabase
+            .from("memories")
+            .update({ access_count: (memory.access_count ?? 0) + 1 })
+            .eq("id", memory.id)
+        )
+      );
+      const incrementError = incrementResults.find((result) => result.error)?.error;
+      if (incrementError) {
+        throw new Error(`Failed to update access counts: ${incrementError.message}`);
+      }
+    }
 
     return {
       content: [

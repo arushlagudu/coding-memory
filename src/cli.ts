@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { analyzeCodebase } from "./ast-index.js";
-import { computeMemoryLinks, decideSaveAction } from "./scoring.js";
+import { computeDecayScore, computeMemoryLinks, decideSaveAction } from "./scoring.js";
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -94,7 +94,14 @@ async function cmdStart(project: string) {
     return;
   }
 
-  const memoryIds = memories.map((m) => m.id);
+  const scoredMemories = memories
+    .map((memory) => ({
+      ...memory,
+      decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0),
+    }))
+    .sort((a, b) => b.decay_score - a.decay_score);
+
+  const memoryIds = scoredMemories.map((m) => m.id);
   const linkedIdsByMemory = new Map<string, Set<string>>();
 
   const idList = memoryIds.join(",");
@@ -112,16 +119,16 @@ async function cmdStart(project: string) {
     linkedIdsByMemory.get(link.target_id)!.add(link.source_id);
   }
 
-  console.log(`Loaded ${memories.length} memory(ies) for "${project}".\n`);
+  console.log(`Loaded ${scoredMemories.length} memory(ies) for "${project}".\n`);
 
   for (const type of MEMORY_TYPES) {
-    const group = memories.filter((m) => m.type === type);
+    const group = scoredMemories.filter((m) => m.type === type);
     if (group.length === 0) continue;
 
     console.log(`${TYPE_LABELS[type]} (${group.length})`);
     console.log("-".repeat(TYPE_LABELS[type].length + 4));
     for (const memory of group) {
-      console.log(`  [${memory.id}] ${memory.content}`);
+      console.log(`  [${memory.id}] (score: ${memory.decay_score.toFixed(2)}) ${memory.content}`);
       const linked = Array.from(linkedIdsByMemory.get(memory.id) ?? []);
       if (linked.length > 0) {
         console.log(`      linked: ${linked.join(", ")}`);
@@ -129,6 +136,17 @@ async function cmdStart(project: string) {
     }
     console.log("");
   }
+
+  const incrementResults = await Promise.all(
+    scoredMemories.map((memory) =>
+      supabase
+        .from("memories")
+        .update({ access_count: (memory.access_count ?? 0) + 1 })
+        .eq("id", memory.id)
+    )
+  );
+  const incrementError = incrementResults.find((result) => result.error)?.error;
+  if (incrementError) fail(`Failed to update access counts: ${incrementError.message}`);
 }
 
 // --- cm save -------------------------------------------------------------

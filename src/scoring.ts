@@ -124,3 +124,15 @@ export function decideSaveAction(
   if (bestSupersede) return { action: "superseded", oldId: bestSupersede.id };
   return { action: "created" };
 }
+
+// --- memory decay --------------------------------------------------------
+
+// Decay constant tuned for a ~14-day half-life: exp(-0.05 * 14) ≈ 0.5.
+const DECAY_LAMBDA = 0.05;
+
+// Recency-weighted relevance: frequently-accessed memories decay slower,
+// but every memory still fades over time regardless of access count.
+export function computeDecayScore(createdAt: Date, accessCount: number): number {
+  const daysSinceCreated = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
+  return (1 + Math.log(1 + accessCount)) * Math.exp(-DECAY_LAMBDA * daysSinceCreated);
+}
