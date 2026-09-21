@@ -136,3 +136,27 @@ export function computeDecayScore(createdAt: Date, accessCount: number): number 
   const daysSinceCreated = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
   return (1 + Math.log(1 + accessCount)) * Math.exp(-DECAY_LAMBDA * daysSinceCreated);
 }
+
+// --- context budget ------------------------------------------------------
+
+// Rough token estimate: ~4 characters per token.
+export function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 4);
+}
+
+// Takes a decay-sorted memory array (highest relevance first) and keeps
+// adding memories until the next one would push the running token count
+// over budget, so what gets injected into an agent's context stays capped.
+export function applyContextBudget(memories: any[], budgetTokens: number): any[] {
+  const result: any[] = [];
+  let usedTokens = 0;
+
+  for (const memory of memories) {
+    const tokens = estimateTokens(memory.content);
+    if (usedTokens + tokens > budgetTokens) break;
+    result.push(memory);
+    usedTokens += tokens;
+  }
+
+  return result;
+}

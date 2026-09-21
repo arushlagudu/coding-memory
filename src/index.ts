@@ -5,7 +5,15 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
-import { computeDecayScore, computeMemoryLinks, decideSaveAction } from "./scoring.js";
+import {
+  applyContextBudget,
+  computeDecayScore,
+  computeMemoryLinks,
+  decideSaveAction,
+  estimateTokens,
+} from "./scoring.js";
+
+const CONTEXT_BUDGET_TOKENS = 2000;
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -56,7 +64,14 @@ server.registerTool(
       }))
       .sort((a, b) => b.decay_score - a.decay_score);
 
-    const memoryIds = scoredMemories.map((m) => m.id);
+    const budgetedMemories = applyContextBudget(scoredMemories, CONTEXT_BUDGET_TOKENS);
+    const omittedCount = scoredMemories.length - budgetedMemories.length;
+    const tokensUsed = budgetedMemories.reduce(
+      (sum, memory) => sum + estimateTokens(memory.content),
+      0
+    );
+
+    const memoryIds = budgetedMemories.map((m) => m.id);
     const linkedIdsByMemory = new Map<string, Set<string>>();
 
     if (memoryIds.length > 0) {
@@ -78,14 +93,14 @@ server.registerTool(
       }
     }
 
-    const memoriesWithLinks = scoredMemories.map((m) => ({
+    const memoriesWithLinks = budgetedMemories.map((m) => ({
       ...m,
       linked_memory_ids: Array.from(linkedIdsByMemory.get(m.id) ?? []),
     }));
 
-    if (scoredMemories.length > 0) {
+    if (budgetedMemories.length > 0) {
       const incrementResults = await Promise.all(
-        scoredMemories.map((memory) =>
+        budgetedMemories.map((memory) =>
           supabase
             .from("memories")
             .update({ access_count: (memory.access_count ?? 0) + 1 })
@@ -98,11 +113,21 @@ server.registerTool(
       }
     }
 
+    const budgetText =
+      omittedCount > 0
+        ? `Loaded ${memories.length} memory row(s) for "${project}" (${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used, ${omittedCount} omitted for budget).`
+        : `Loaded ${memories.length} memory row(s) for "${project}" (${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used).`;
+
     return {
-      content: [
-        { type: "text", text: `Loaded ${memories.length} memory row(s) for "${project}".` },
-      ],
-      structuredContent: { memories: memoriesWithLinks },
+      content: [{ type: "text", text: budgetText }],
+      structuredContent: {
+        memories: memoriesWithLinks,
+        context_budget: {
+          budget_tokens: CONTEXT_BUDGET_TOKENS,
+          tokens_used: tokensUsed,
+          omitted_count: omittedCount,
+        },
+      },
     };
   }
 );

@@ -2,7 +2,15 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { analyzeCodebase } from "./ast-index.js";
-import { computeDecayScore, computeMemoryLinks, decideSaveAction } from "./scoring.js";
+import {
+  applyContextBudget,
+  computeDecayScore,
+  computeMemoryLinks,
+  decideSaveAction,
+  estimateTokens,
+} from "./scoring.js";
+
+const CONTEXT_BUDGET_TOKENS = 2000;
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -42,9 +50,10 @@ function cmdHelp() {
   console.log(`cm — coding memory CLI
 
   cm start <project>
-      Load all unresolved memories for a project, grouped by type
-      (decisions, constraints, discoveries, rejections), with linked
-      memory ids shown under each entry.
+      Load all unresolved memories for a project, sorted by decay
+      score and capped at a 2000 token context budget, grouped by
+      type (decisions, constraints, discoveries, rejections), with
+      linked memory ids shown under each entry.
 
   cm save <project> <type> <content>
       Save a new memory. <type> is one of: decision, rejection,
@@ -101,7 +110,14 @@ async function cmdStart(project: string) {
     }))
     .sort((a, b) => b.decay_score - a.decay_score);
 
-  const memoryIds = scoredMemories.map((m) => m.id);
+  const budgetedMemories = applyContextBudget(scoredMemories, CONTEXT_BUDGET_TOKENS);
+  const omittedCount = scoredMemories.length - budgetedMemories.length;
+  const tokensUsed = budgetedMemories.reduce(
+    (sum, memory) => sum + estimateTokens(memory.content),
+    0
+  );
+
+  const memoryIds = budgetedMemories.map((m) => m.id);
   const linkedIdsByMemory = new Map<string, Set<string>>();
 
   const idList = memoryIds.join(",");
@@ -122,7 +138,7 @@ async function cmdStart(project: string) {
   console.log(`Loaded ${scoredMemories.length} memory(ies) for "${project}".\n`);
 
   for (const type of MEMORY_TYPES) {
-    const group = scoredMemories.filter((m) => m.type === type);
+    const group = budgetedMemories.filter((m) => m.type === type);
     if (group.length === 0) continue;
 
     console.log(`${TYPE_LABELS[type]} (${group.length})`);
@@ -137,8 +153,13 @@ async function cmdStart(project: string) {
     console.log("");
   }
 
+  console.log(`Context budget: ${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used`);
+  if (omittedCount > 0) {
+    console.log(`${omittedCount} memories omitted (budget exceeded)`);
+  }
+
   const incrementResults = await Promise.all(
-    scoredMemories.map((memory) =>
+    budgetedMemories.map((memory) =>
       supabase
         .from("memories")
         .update({ access_count: (memory.access_count ?? 0) + 1 })
