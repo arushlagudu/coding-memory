@@ -160,3 +160,89 @@ export function applyContextBudget(memories: any[], budgetTokens: number): any[]
 
   return result;
 }
+
+// --- memory compression --------------------------------------------------
+
+const CLUSTER_THRESHOLD = 0.2;
+
+// Single-linkage clustering over containment score: two memories join the
+// same cluster if they score > 0.2, and clusters merge transitively (via
+// union-find) even if the two memories that join them don't directly score
+// above the threshold themselves.
+export function clusterMemories(memories: any[]): any[][] {
+  const parent = memories.map((_, index) => index);
+
+  function find(index: number): number {
+    while (parent[index] !== index) {
+      parent[index] = parent[parent[index]];
+      index = parent[index];
+    }
+    return index;
+  }
+
+  function union(a: number, b: number) {
+    const rootA = find(a);
+    const rootB = find(b);
+    if (rootA !== rootB) parent[rootA] = rootB;
+  }
+
+  const entities = memories.map((memory) => extractEntities(memory.content));
+
+  for (let i = 0; i < memories.length; i++) {
+    for (let j = i + 1; j < memories.length; j++) {
+      if (containmentScore(entities[i], entities[j]) > CLUSTER_THRESHOLD) {
+        union(i, j);
+      }
+    }
+  }
+
+  const clustersByRoot = new Map<number, any[]>();
+  for (let i = 0; i < memories.length; i++) {
+    const root = find(i);
+    if (!clustersByRoot.has(root)) clustersByRoot.set(root, []);
+    clustersByRoot.get(root)!.push(memories[i]);
+  }
+
+  return Array.from(clustersByRoot.values());
+}
+
+const SUMMARY_ITEM_LENGTH = 60;
+
+// Builds a compact summary for a cluster of related memories: the most
+// common type in the cluster, the most frequent shared entity as the
+// "topic", and each memory's content truncated and joined.
+export function buildSummaryContent(cluster: any[]): string {
+  const typeCounts = new Map<string, number>();
+  for (const memory of cluster) {
+    typeCounts.set(memory.type, (typeCounts.get(memory.type) ?? 0) + 1);
+  }
+  let mostCommonType = cluster[0]?.type ?? "discovery";
+  let maxTypeCount = 0;
+  for (const [type, count] of typeCounts) {
+    if (count > maxTypeCount) {
+      maxTypeCount = count;
+      mostCommonType = type;
+    }
+  }
+
+  const entityCounts = new Map<string, number>();
+  for (const memory of cluster) {
+    for (const entity of extractEntities(memory.content)) {
+      entityCounts.set(entity, (entityCounts.get(entity) ?? 0) + 1);
+    }
+  }
+  let topic = "general";
+  let maxEntityCount = 0;
+  for (const [entity, count] of entityCounts) {
+    if (count > maxEntityCount) {
+      maxEntityCount = count;
+      topic = entity;
+    }
+  }
+
+  const items = cluster
+    .map((memory) => memory.content.slice(0, SUMMARY_ITEM_LENGTH))
+    .join("; ");
+
+  return `[${mostCommonType.toUpperCase()} cluster] ${topic}: ${items}`;
+}

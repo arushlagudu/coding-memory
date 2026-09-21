@@ -4,6 +4,8 @@ import { createClient } from "@supabase/supabase-js";
 import { analyzeCodebase } from "./ast-index.js";
 import {
   applyContextBudget,
+  buildSummaryContent,
+  clusterMemories,
   computeDecayScore,
   computeMemoryLinks,
   decideSaveAction,
@@ -11,6 +13,7 @@ import {
 } from "./scoring.js";
 
 const CONTEXT_BUDGET_TOKENS = 2000;
+const COMPRESSION_THRESHOLD = 20;
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -42,6 +45,7 @@ function usage(): never {
   cm search <project> <query>
   cm resolve <project> <memory-id>
   cm delete <project> <memory-id>
+  cm compress <project>
   cm help`);
   process.exit(1);
 }
@@ -76,6 +80,10 @@ function cmdHelp() {
 
   cm delete <project> <memory-id>
       Delete a memory and any memory_links referencing it.
+
+  cm compress <project>
+      Cluster related unresolved memories (needs 20+) and collapse
+      clusters of 3 or more into a single summary memory.
 
   cm help
       Show this help message.`);
@@ -225,6 +233,76 @@ async function cmdSave(project: string, type: string, content: string) {
   console.log(`Saved ${type} [${newMemoryId}] for "${project}".`);
   if (links.length > 0) {
     console.log(`Linked to ${links.length} existing memory(ies): ${links.map((l) => l.target_id).join(", ")}`);
+  }
+
+  const { count: unresolvedCount, error: countError } = await supabase
+    .from("memories")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (countError) fail(`Failed to count memories: ${countError.message}`);
+
+  if ((unresolvedCount ?? 0) >= COMPRESSION_THRESHOLD) {
+    await compressMemories(project);
+  }
+}
+
+// --- memory compression ----------------------------------------------------
+
+async function compressMemories(
+  project: string
+): Promise<{ totalUnresolved: number; clustersCompressed: number }> {
+  const { data, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (error) fail(`Failed to load memories for compression: ${error.message}`);
+
+  const memories = data ?? [];
+  if (memories.length < COMPRESSION_THRESHOLD) {
+    return { totalUnresolved: memories.length, clustersCompressed: 0 };
+  }
+
+  const clusters = clusterMemories(memories);
+  let clustersCompressed = 0;
+
+  for (const cluster of clusters) {
+    if (cluster.length < 3) continue;
+
+    const summaryContent = buildSummaryContent(cluster);
+    const { error: insertError } = await supabase
+      .from("memories")
+      .insert({ project, type: "discovery", content: summaryContent });
+
+    if (insertError) fail(`Failed to insert summary memory: ${insertError.message}`);
+
+    const idsToResolve = cluster.map((memory) => memory.id);
+    const { error: resolveError } = await supabase
+      .from("memories")
+      .update({ resolved: true })
+      .in("id", idsToResolve);
+
+    if (resolveError) fail(`Failed to resolve compressed memories: ${resolveError.message}`);
+
+    console.log(`Compressed ${cluster.length} memories into 1 summary`);
+    clustersCompressed++;
+  }
+
+  console.log(`Compression complete. ${clustersCompressed} clusters compressed.`);
+  return { totalUnresolved: memories.length, clustersCompressed };
+}
+
+// --- cm compress -------------------------------------------------------
+
+async function cmdCompress(project: string) {
+  const result = await compressMemories(project);
+  if (result.totalUnresolved < COMPRESSION_THRESHOLD) {
+    console.log(
+      `Not enough memories to compress (need ${COMPRESSION_THRESHOLD}+, have ${result.totalUnresolved}).`
+    );
   }
 }
 
@@ -382,6 +460,12 @@ async function main() {
       const [project, memoryId] = args;
       if (!project || !memoryId) usage();
       await cmdDelete(project, memoryId);
+      break;
+    }
+    case "compress": {
+      const [project] = args;
+      if (!project) usage();
+      await cmdCompress(project);
       break;
     }
     case "help": {

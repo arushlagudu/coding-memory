@@ -7,6 +7,8 @@ import { z } from "zod";
 import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
 import {
   applyContextBudget,
+  buildSummaryContent,
+  clusterMemories,
   computeDecayScore,
   computeMemoryLinks,
   decideSaveAction,
@@ -14,6 +16,7 @@ import {
 } from "./scoring.js";
 
 const CONTEXT_BUDGET_TOKENS = 2000;
+const COMPRESSION_THRESHOLD = 20;
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -132,6 +135,59 @@ server.registerTool(
   }
 );
 
+// --- memory compression ----------------------------------------------------
+
+async function compressMemories(
+  project: string
+): Promise<{ totalUnresolved: number; clustersCompressed: number }> {
+  const { data, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (error) {
+    throw new Error(`Failed to load memories for compression: ${error.message}`);
+  }
+
+  const memories = data ?? [];
+  if (memories.length < COMPRESSION_THRESHOLD) {
+    return { totalUnresolved: memories.length, clustersCompressed: 0 };
+  }
+
+  const clusters = clusterMemories(memories);
+  let clustersCompressed = 0;
+
+  for (const cluster of clusters) {
+    if (cluster.length < 3) continue;
+
+    const summaryContent = buildSummaryContent(cluster);
+    const { error: insertError } = await supabase
+      .from("memories")
+      .insert({ project, type: "discovery", content: summaryContent });
+
+    if (insertError) {
+      throw new Error(`Failed to insert summary memory: ${insertError.message}`);
+    }
+
+    const idsToResolve = cluster.map((memory) => memory.id);
+    const { error: resolveError } = await supabase
+      .from("memories")
+      .update({ resolved: true })
+      .in("id", idsToResolve);
+
+    if (resolveError) {
+      throw new Error(`Failed to resolve compressed memories: ${resolveError.message}`);
+    }
+
+    console.error(`Compressed ${cluster.length} memories into 1 summary`);
+    clustersCompressed++;
+  }
+
+  console.error(`Compression complete. ${clustersCompressed} clusters compressed.`);
+  return { totalUnresolved: memories.length, clustersCompressed };
+}
+
 // --- save_memory ---------------------------------------------------------
 
 const memoryTypeEnum = z.enum([
@@ -207,6 +263,20 @@ server.registerTool(
       if (linkError) {
         throw new Error(`Failed to save memory links: ${linkError.message}`);
       }
+    }
+
+    const { count: unresolvedCount, error: countError } = await supabase
+      .from("memories")
+      .select("id", { count: "exact", head: true })
+      .eq("project", project)
+      .eq("resolved", false);
+
+    if (countError) {
+      throw new Error(`Failed to count memories: ${countError.message}`);
+    }
+
+    if ((unresolvedCount ?? 0) >= COMPRESSION_THRESHOLD) {
+      await compressMemories(project);
     }
 
     if (decision.action === "superseded") {
