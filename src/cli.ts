@@ -2,7 +2,7 @@
 import "dotenv/config";
 import { createClient } from "@supabase/supabase-js";
 import { analyzeCodebase } from "./ast-index.js";
-import { extractEntities, containmentScore } from "./scoring.js";
+import { computeMemoryLinks, decideSaveAction } from "./scoring.js";
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -138,6 +138,31 @@ async function cmdSave(project: string, type: string, content: string) {
     fail(`Invalid type "${type}". Must be one of: ${MEMORY_TYPES.join(", ")}`);
   }
 
+  const { data: existingRows, error: existingError } = await supabase
+    .from("memories")
+    .select("id, content")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (existingError) fail(`Failed to load memories: ${existingError.message}`);
+
+  const existingMemories = existingRows ?? [];
+  const decision = decideSaveAction(content, existingMemories);
+
+  if (decision.action === "duplicate") {
+    console.log("Duplicate memory detected — skipping.");
+    return;
+  }
+
+  if (decision.action === "superseded") {
+    const { error: resolveError } = await supabase
+      .from("memories")
+      .update({ resolved: true })
+      .eq("id", decision.oldId);
+
+    if (resolveError) fail(`Failed to resolve superseded memory: ${resolveError.message}`);
+  }
+
   const { data: inserted, error } = await supabase
     .from("memories")
     .insert({ project, type, content })
@@ -147,33 +172,15 @@ async function cmdSave(project: string, type: string, content: string) {
   if (error || !inserted) fail(`Failed to save memory: ${error?.message ?? "no row returned"}`);
 
   const newMemoryId = inserted.id;
-
-  const { data: recentMemories, error: recentError } = await supabase
-    .from("memories")
-    .select("id, content")
-    .eq("project", project)
-    .eq("resolved", false)
-    .neq("id", newMemoryId)
-    .order("created_at", { ascending: false })
-    .limit(50);
-
-  if (recentError) fail(`Failed to load memories for linking: ${recentError.message}`);
-
-  const existingMemories = recentMemories ?? [];
-  const existingEntities = existingMemories.map((existing) => extractEntities(existing.content));
-  const newEntities = extractEntities(content);
-
-  const links = existingMemories
-    .map((existing, index) => ({
-      source_id: newMemoryId,
-      target_id: existing.id,
-      score: containmentScore(newEntities, existingEntities[index]),
-    }))
-    .filter((link) => link.score > 0.15);
+  const links = computeMemoryLinks(newMemoryId, content, existingMemories);
 
   if (links.length > 0) {
     const { error: linkError } = await supabase.from("memory_links").insert(links);
     if (linkError) fail(`Failed to save memory links: ${linkError.message}`);
+  }
+
+  if (decision.action === "superseded") {
+    console.log(`Superseded previous memory [${decision.oldId}].`);
   }
 
   console.log(`Saved ${type} [${newMemoryId}] for "${project}".`);

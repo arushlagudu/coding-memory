@@ -5,7 +5,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
-import { extractEntities, containmentScore } from "./scoring.js";
+import { computeMemoryLinks, decideSaveAction } from "./scoring.js";
 
 const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
 
@@ -107,6 +107,41 @@ server.registerTool(
     },
   },
   async ({ project, type, content }) => {
+    const { data: existingRows, error: existingError } = await supabase
+      .from("memories")
+      .select("id, content")
+      .eq("project", project)
+      .eq("resolved", false);
+
+    if (existingError) {
+      throw new Error(`Failed to load memories: ${existingError.message}`);
+    }
+
+    const existingMemories = existingRows ?? [];
+    const decision = decideSaveAction(content, existingMemories);
+
+    if (decision.action === "duplicate") {
+      return {
+        content: [{ type: "text", text: "Duplicate memory detected — skipping." }],
+        structuredContent: {
+          saved: false,
+          reason: "duplicate",
+          matched_id: decision.matchedId,
+        },
+      };
+    }
+
+    if (decision.action === "superseded") {
+      const { error: resolveError } = await supabase
+        .from("memories")
+        .update({ resolved: true })
+        .eq("id", decision.oldId);
+
+      if (resolveError) {
+        throw new Error(`Failed to resolve superseded memory: ${resolveError.message}`);
+      }
+    }
+
     const { data: inserted, error } = await supabase
       .from("memories")
       .insert({ project, type, content })
@@ -118,35 +153,7 @@ server.registerTool(
     }
 
     const newMemoryId = inserted.id;
-
-    const { data: recentMemories, error: recentError } = await supabase
-      .from("memories")
-      .select("id, content")
-      .eq("project", project)
-      .eq("resolved", false)
-      .neq("id", newMemoryId)
-      .order("created_at", { ascending: false })
-      .limit(50);
-
-    if (recentError) {
-      throw new Error(`Failed to load memories for linking: ${recentError.message}`);
-    }
-
-    const existingMemories = recentMemories ?? [];
-    const existingEntities = existingMemories.map((existing) => extractEntities(existing.content));
-    const newEntities = extractEntities(content);
-
-    const links = existingMemories
-      .map((existing, index) => {
-        const score = containmentScore(newEntities, existingEntities[index]);
-        console.error(`SCORE: [${content}] vs [${existing.content}] = ${score}`);
-        return {
-          source_id: newMemoryId,
-          target_id: existing.id,
-          score,
-        };
-      })
-      .filter((link) => link.score > 0.15);
+    const links = computeMemoryLinks(newMemoryId, content, existingMemories);
 
     if (links.length > 0) {
       const { error: linkError } = await supabase.from("memory_links").insert(links);
@@ -155,10 +162,16 @@ server.registerTool(
       }
     }
 
-    const saved = true as const;
+    if (decision.action === "superseded") {
+      return {
+        content: [{ type: "text", text: `Superseded previous memory [${decision.oldId}].` }],
+        structuredContent: { saved: true, action: "superseded", old_id: decision.oldId },
+      };
+    }
+
     return {
       content: [{ type: "text", text: "Memory saved." }],
-      structuredContent: { saved },
+      structuredContent: { saved: true, action: "created" },
     };
   }
 );
