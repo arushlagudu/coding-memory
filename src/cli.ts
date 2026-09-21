@@ -13,6 +13,7 @@ import {
   computeMemoryLinks,
   decideSaveAction,
   estimateTokens,
+  scoreMemoryRelevance,
 } from "./scoring.js";
 
 const CONTEXT_BUDGET_TOKENS = 2000;
@@ -57,6 +58,7 @@ function usage(): never {
   cm delete <project> <memory-id>
   cm compress <project>
   cm init <project> <path>
+  cm context <project> <task>
   cm help`);
   process.exit(1);
 }
@@ -101,6 +103,11 @@ function cmdHelp() {
       records the commit message and any implicit memories (removed
       imports, new env vars, new auth-related files) after every
       commit.
+
+  cm context <project> <task>
+      Return only the top 5 memories most relevant to a specific
+      task, ranked by a blend of task relevance and decay score,
+      as a markdown block capped at a 2000 token budget.
 
   cm help
       Show this help message.`);
@@ -553,6 +560,62 @@ async function cmdInit(project: string, targetPath: string) {
   console.log(`coding-memory hook installed for project ${project} at ${targetPath}`);
 }
 
+// --- cm context ------------------------------------------------------------
+
+const CONTEXT_TYPE_ORDER: MemoryType[] = ["decision", "constraint", "rejection", "discovery"];
+const CONTEXT_TOP_N = 5;
+
+async function cmdContext(project: string, task: string) {
+  const { data, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (error) fail(`Failed to load memories: ${error.message}`);
+
+  const memories = data ?? [];
+  if (memories.length === 0) {
+    console.log(`No memories found for "${project}".`);
+    return;
+  }
+
+  const scoredMemories = memories
+    .map((memory) => {
+      const decayScore = computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0);
+      const relevanceScore = scoreMemoryRelevance(memory.content, task);
+      return {
+        ...memory,
+        combined_score: relevanceScore * 0.6 + decayScore * 0.4,
+      };
+    })
+    .sort((a, b) => b.combined_score - a.combined_score);
+
+  const topMemories = scoredMemories.slice(0, CONTEXT_TOP_N);
+  const budgetedMemories = applyContextBudget(topMemories, CONTEXT_BUDGET_TOKENS);
+  const tokensUsed = budgetedMemories.reduce(
+    (sum, memory) => sum + estimateTokens(memory.content),
+    0
+  );
+
+  const lines: string[] = [`## Project Context: ${project}`, `### Task: ${task}`, ""];
+
+  for (const type of CONTEXT_TYPE_ORDER) {
+    const group = budgetedMemories.filter((memory) => memory.type === type);
+    if (group.length === 0) continue;
+
+    lines.push(`**${TYPE_LABELS[type]}**`);
+    for (const memory of group) {
+      lines.push(`- ${memory.content}`);
+    }
+    lines.push("");
+  }
+
+  lines.push(`*(${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used)*`);
+
+  console.log(lines.join("\n"));
+}
+
 // --- main --------------------------------------------------------------
 
 async function main() {
@@ -611,6 +674,12 @@ async function main() {
       const [project, targetPath] = args;
       if (!project || !targetPath) usage();
       await cmdInit(project, targetPath);
+      break;
+    }
+    case "context": {
+      const [project, ...rest] = args;
+      if (!project || rest.length === 0) usage();
+      await cmdContext(project, rest.join(" "));
       break;
     }
     case "help": {

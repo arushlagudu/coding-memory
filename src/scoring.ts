@@ -246,3 +246,30 @@ export function buildSummaryContent(cluster: any[]): string {
 
   return `[${mostCommonType.toUpperCase()} cluster] ${topic}: ${items}`;
 }
+
+// --- task relevance --------------------------------------------------------
+
+function splitWords(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((word) => word.length > 0 && !STOP_WORDS.has(word));
+}
+
+// Blends entity containment (structural overlap) with raw word overlap
+// (surface-level phrasing match) so a memory that shares the task's exact
+// wording scores well even if its extracted entities don't line up neatly.
+export function scoreMemoryRelevance(memoryContent: string, task: string): number {
+  const containment = containmentScore(extractEntities(memoryContent), extractEntities(task));
+
+  const memoryWords = new Set(splitWords(memoryContent));
+  const taskWords = splitWords(task);
+
+  let shared = 0;
+  for (const word of taskWords) {
+    if (memoryWords.has(word)) shared++;
+  }
+  const wordOverlapRatio = taskWords.length === 0 ? 0 : shared / taskWords.length;
+
+  return containment * 0.7 + wordOverlapRatio * 0.3;
+}
