@@ -1,21 +1,13 @@
 # coding-memory
 
-AI coding agents forget everything between sessions. Every new chat re-derives decisions, re-breaks constraints, and re-debugs errors it already fixed last week.
+AI agents forget everything between sessions. Every new chat re-derives decisions, re-breaks constraints that were already settled, and re-debugs errors that were already fixed last week.
 
-coding-memory is a CLI and MCP server that stores that context in Supabase and hands it back at the start of the next session — plus a git post-commit hook that captures a lot of it automatically, so you don't have to remember to call `cm save` yourself.
-
-## How it works
-
-- Session memory: decisions, constraints, discoveries, and rejections, typed and scoped to a project
-- Execution log: problems and their fixes, so an agent that already spent 20 minutes on a tsc error doesn't spend another 20 minutes on it next week
-- Semantic linking: new memories auto-link to related ones using containment scoring — no manual tagging
-- Decay scoring: memories are ranked by recency and access frequency, so older unused memories rank lower and eventually drop out of context
-- Git hook: commit messages, removed imports, new env vars, TODOs, package.json changes, new config files, and schema changes are captured automatically on every commit
+coding-memory is a CLI and an MCP server that stores that context in Supabase and hands it back at the start of the next session. A git post-commit hook captures most of it automatically.
 
 ## Install
 
 ```
-git clone https://github.com/yourname/coding-memory.git
+git clone https://github.com/arushlagudu/coding-memory.git
 cd coding-memory
 npm install
 ```
@@ -27,7 +19,7 @@ SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 ```
 
-Build and link the CLI:
+Build and link:
 
 ```
 npm run build
@@ -35,22 +27,19 @@ sudo npm link
 sudo npm install -g tsx
 ```
 
-Now `cm` is on your PATH.
-
-Then, from inside the project you want tracked:
+`cm` is now on your PATH. Install the hook in a project:
 
 ```
-cd ~/code/myapp
-cm init myapp .
+$ cd your-project-directory
+$ cm init myapp .
+coding-memory hook installed for project myapp at .
 ```
 
-This installs a post-commit hook that auto-saves memories on every commit — no need to call `cm save` by hand for the stuff the hook already catches.
-
-## Commands
+## Usage
 
 ```
 cm start <project>
-cm save <project> <type> <content>
+cm save <project> <type> <content> [--force]
 cm fix <project> <problem> <solution>
 cm analyze <project> <path>
 cm search <project> <query>
@@ -63,8 +52,6 @@ cm help
 ```
 
 ### cm start
-
-Loads everything unresolved for a project, grouped by type, with links shown underneath.
 
 ```
 $ cm start myapp
@@ -83,12 +70,32 @@ Constraints (1)
 
 ### cm save
 
+`type` is one of `decision`, `rejection`, `constraint`, `discovery`.
+
 ```
 $ cm save myapp decision "Use ilike search across memories and execution_log"
 Saved decision [294fba3a-aef3-472a-933f-b6bfd41c7cfa] for "myapp".
 ```
 
-`type` is one of `decision`, `rejection`, `constraint`, `discovery`.
+If the new content contradicts something already stored, it asks first.
+
+```
+$ cm save myapp decision "We switched from Supabase to Postgres directly"
+Conflict detected:
+  Old: Use Supabase for persistence layer
+  New: We switched from Supabase to Postgres directly
+
+Keep old or replace? (k/r): r
+Replaced with new memory [b1a2c3d4-5678-90ab-cdef-1234567890ab].
+```
+
+`--force` skips the prompt and always replaces. Use it from scripts.
+
+```
+$ cm save myapp decision "We switched from Supabase to Postgres directly" --force
+Replaced with new memory [b1a2c3d4-5678-90ab-cdef-1234567890ab].
+Saved decision [b1a2c3d4-5678-90ab-cdef-1234567890ab] for "myapp".
+```
 
 ### cm fix
 
@@ -97,9 +104,20 @@ $ cm fix myapp "tsc failed with Node16 module resolution error" "switched module
 Fix recorded for "myapp".
 ```
 
+### cm analyze
+
+```
+$ cm analyze myapp .
+Indexed 7 file(s):
+  functions: 24
+  classes:   0
+```
+
+Runs tree-sitter over the project and writes an AST index to `.coding-memory/ast-index.db`.
+
 ### cm search
 
-Searches memories and past fixes at the same time.
+Checks memories and past fixes in the same query.
 
 ```
 $ cm search myapp "module resolution"
@@ -109,17 +127,6 @@ No results found
 Past Fixes (1)
   Problem:  tsc failed with Node16 module resolution error
   Solution: switched moduleResolution to Node16
-```
-
-### cm analyze
-
-Walks the project with tree-sitter and indexes functions, classes, and imports into a local sqlite file at `.coding-memory/ast-index.db`.
-
-```
-$ cm analyze myapp .
-Indexed 7 file(s):
-  functions: 24
-  classes:   0
 ```
 
 ### cm resolve / cm delete
@@ -132,11 +139,9 @@ $ cm delete myapp 793a0053-83b6-463a-9e6d-df8b7c2fbed8
 Deleted memory [793a0053-83b6-463a-9e6d-df8b7c2fbed8]
 ```
 
-`delete` also removes any memory_links pointing at that id, so you don't end up with dangling links.
+`delete` also removes any memory_links pointing at that id.
 
 ### cm context
-
-Returns only the top 5 memories most relevant to a specific task, blending task relevance with decay score, as a markdown block capped at the 2000 token budget. This is what you feed an agent instead of dumping the whole project's memory on it.
 
 ```
 $ cm context myapp "fix the module resolution error in the build"
@@ -152,9 +157,9 @@ $ cm context myapp "fix the module resolution error in the build"
 *(41/2000 tokens used)*
 ```
 
-### cm compress
+Top 5 memories relevant to a task, ranked by relevance and decay, capped at 2000 tokens. Feed this to an agent instead of the whole project's memory.
 
-Clusters related unresolved memories (needs 20+) and collapses clusters of 3 or more into a single summary memory. Runs automatically past the threshold, but can be triggered by hand too.
+### cm compress
 
 ```
 $ cm compress myapp
@@ -163,30 +168,56 @@ Compressed 3 memories into 1 summary
 Compression complete. 2 clusters compressed.
 ```
 
-### cm init
+Needs 20+ unresolved memories. Also runs automatically once a project crosses that count.
 
-Installs a git post-commit hook in the repo at `<path>` that runs `dist/cli.js save` after every commit, feeding it the commit message plus whatever the diff analysis picks up (removed imports, new env vars, new auth-related files, package.json additions/removals, new config files, schema/migration files, TODOs).
+### cm init
 
 ```
 $ cm init myapp .
 coding-memory hook installed for project myapp at .
 ```
 
-## How it works under the hood
+Installs a post-commit hook that calls `dist/cli.js save` after every commit with the commit message, plus whatever the diff turns up: removed imports, new env vars, new auth files, package.json changes, new config files, schema files, TODOs.
 
-- Atomic CRUD: before a memory is inserted, it's checked against existing ones. A containment score above 0.85 with no negation word (e.g. "switched", "no longer") is treated as a duplicate and the insert is skipped. The same high-similarity match combined with a negation word is treated as a contradiction — the old memory is marked resolved and the new one is inserted in its place.
-- Context budget: both `cm start` and `cm context` enforce a hard 2000 token limit. Memories are decay-ranked first, then added in that order until the next one would blow the budget.
-- Compression: once a project crosses 20 unresolved memories, single-linkage clustering (containment score > 0.2, union-find merge) groups related memories, and clusters of 3+ collapse into a single summary memory.
-- Decay formula: `score = (1 + ln(1 + accessCount)) * exp(-0.05 * daysSinceCreated)`. Frequently-accessed memories decay slower, but everything fades eventually — the 0.05 constant gives roughly a 14-day half-life.
+### cm help
+
+```
+$ cm help
+cm — coding memory CLI
+
+  cm start <project>
+      Load all unresolved memories for a project, sorted by decay
+      score and capped at a 2000 token context budget.
+
+  cm save <project> <type> <content> [--force]
+      Save a new memory. Prompts before overwriting a contradiction
+      unless --force is passed.
+
+  ...
+```
+
+## How it works
+
+Memories are decisions, constraints, discoveries, and rejections, scoped to a project. Fixes are stored separately as a problem string and the solution that closed it, so the same tsc error doesn't cost another 20 minutes next month.
+
+Every save checks new content against existing memories with a containment score: shared terms over the size of the smaller set. Above 0.85 with no negation word, it's a duplicate and gets skipped. With a negation word like "switched" or "no longer" and a score above 0.4, it's a contradiction.
+
+cm save stops and asks whether to keep the old memory or replace it, unless `--force` is passed. The MCP `save_memory` tool always replaces automatically, since nothing is watching stdin on that path.
+
+New memories are also compared against everything else and linked above a lower threshold of 0.15. `cm start` and `cm context` show those links without any manual tagging.
+
+Relevance decays over time: `score = (1 + ln(1 + accessCount)) * exp(-0.05 * daysSinceCreated)`. Frequently accessed memories decay slower, but nothing survives forever. The 0.05 constant works out to roughly a 14-day half life.
+
+`cm start` and `cm context` cap output at 2000 tokens. They fill from the highest-ranked memory down until the next one would push past that limit.
+
+Past 20 unresolved memories, `cm compress` clusters related memories by containment score above 0.2 using union-find. Clusters of 3 or more collapse into a single summary memory.
 
 ## Research
 
-Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP (arXiv:2603.27277). AST-based codebase indexing hits 83% answer quality at 10x fewer tokens than file-by-file exploration.
+Ideas taken from a few papers, not implementations of them.
 
-Feedback-Normalized Developer Memory for Reinforcement-Learning Coding Agents: A Safety-Gated MCP Architecture (arXiv:2605.01567). Tracks terminal errors and failed fixes across sessions so agents don't repeat mistakes.
-
-A-MEM: Agentic Memory for LLM Agents (arXiv:2502.12110, NeurIPS 2025). Zettelkasten-inspired memory network where new memories auto-link to related prior memories.
-
-SWE-MeM: Learning Adaptive Memory Management for Long-Horizon Coding Agents (arXiv:2606.28434, June 2026). Proactive compression framework — agents decide when and what to compress based on context budget, rather than compressing on a fixed schedule.
-
-AtomMem: Learnable Dynamic Agentic Memory with Atomic Memory Operation (arXiv:2601.08323, Jan 2026). Treats CRUD operations as atomic decisions rather than blind inserts — the basis for the duplicate and contradiction detection above.
+- Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP (arXiv:2603.27277)
+- Feedback-Normalized Developer Memory for Reinforcement-Learning Coding Agents (arXiv:2605.01567)
+- A-MEM: Agentic Memory for LLM Agents (arXiv:2502.12110, NeurIPS 2025)
+- SWE-MeM: Learning Adaptive Memory Management for Long-Horizon Coding Agents (arXiv:2606.28434)
+- AtomMem: Learnable Dynamic Agentic Memory with Atomic Memory Operation (arXiv:2601.08323)
