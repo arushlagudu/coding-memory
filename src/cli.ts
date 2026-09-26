@@ -2,6 +2,7 @@
 import nodeFs from "node:fs";
 import nodePath from "node:path";
 import { fileURLToPath } from "node:url";
+import { createInterface } from "node:readline/promises";
 import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import { analyzeCodebase } from "./ast-index.js";
@@ -54,7 +55,7 @@ const TYPE_LABELS: Record<MemoryType, string> = {
 function usage(): never {
   console.error(`Usage:
   cm start <project>
-  cm save <project> <type> <content>      (type: decision|rejection|constraint|discovery)
+  cm save <project> <type> <content> [--force]  (type: decision|rejection|constraint|discovery)
   cm fix <project> <problem> <solution>
   cm analyze <project> <path>
   cm search <project> <query>
@@ -76,10 +77,12 @@ function cmdHelp() {
       type (decisions, constraints, discoveries, rejections), with
       linked memory ids shown under each entry.
 
-  cm save <project> <type> <content>
+  cm save <project> <type> <content> [--force]
       Save a new memory. <type> is one of: decision, rejection,
       constraint, discovery. Automatically links to related existing
-      memories.
+      memories. If the new memory contradicts an existing one, prompts
+      to keep the old memory or replace it — pass --force to skip the
+      prompt and always replace.
 
   cm fix <project> <problem> <solution>
       Record a problem and its solution for future reference.
@@ -208,7 +211,36 @@ async function cmdStart(project: string) {
 
 // --- cm save -------------------------------------------------------------
 
-async function cmdSave(project: string, type: string, content: string) {
+// Prompts on stdin before superseding — cm save runs interactively, unlike
+// the MCP save_memory tool, which must supersede automatically since it has
+// no user attached to ask.
+async function confirmSupersede(oldId: string, newContent: string): Promise<boolean> {
+  const { data: oldMemory, error } = await supabase
+    .from("memories")
+    .select("content")
+    .eq("id", oldId)
+    .single();
+
+  if (error || !oldMemory) fail(`Failed to load superseded memory: ${error?.message ?? "not found"}`);
+
+  console.log(`Conflict detected:\n  Old: ${oldMemory.content}\n  New: ${newContent}\n`);
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question("Keep old or replace? (k/r): ")).trim().toLowerCase();
+  rl.close();
+
+  if (answer === "k") {
+    console.log("Kept original memory.");
+    return false;
+  }
+  if (answer === "r") {
+    return true;
+  }
+  console.log("Invalid input — kept original memory.");
+  return false;
+}
+
+async function cmdSave(project: string, type: string, content: string, force = false) {
   if (!MEMORY_TYPES.includes(type as MemoryType)) {
     fail(`Invalid type "${type}". Must be one of: ${MEMORY_TYPES.join(", ")}`);
   }
@@ -227,6 +259,11 @@ async function cmdSave(project: string, type: string, content: string) {
   if (decision.action === "duplicate") {
     console.log("Duplicate memory detected — skipping.");
     return;
+  }
+
+  if (decision.action === "superseded" && !force) {
+    const shouldSupersede = await confirmSupersede(decision.oldId, content);
+    if (!shouldSupersede) return;
   }
 
   if (decision.action === "superseded") {
@@ -255,7 +292,7 @@ async function cmdSave(project: string, type: string, content: string) {
   }
 
   if (decision.action === "superseded") {
-    console.log(`Superseded previous memory [${decision.oldId}].`);
+    console.log(`Replaced with new memory [${newMemoryId}].`);
   }
 
   console.log(`Saved ${type} [${newMemoryId}] for "${project}".`);
@@ -721,9 +758,14 @@ async function main() {
       break;
     }
     case "save": {
-      const [project, type, ...rest] = args;
+      const forceIndex = args.indexOf("--force");
+      const force = forceIndex !== -1;
+      const positional = force
+        ? [...args.slice(0, forceIndex), ...args.slice(forceIndex + 1)]
+        : args;
+      const [project, type, ...rest] = positional;
       if (!project || !type || rest.length === 0) usage();
-      await cmdSave(project, type, rest.join(" "));
+      await cmdSave(project, type, rest.join(" "), force);
       break;
     }
     case "fix": {
