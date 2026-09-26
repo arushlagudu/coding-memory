@@ -19,6 +19,10 @@ import {
 const CONTEXT_BUDGET_TOKENS = 2000;
 const COMPRESSION_THRESHOLD = 20;
 const CLI_PATH = fileURLToPath(import.meta.url);
+// The hook must always shell out to the compiled CLI, never `tsx src/cli.ts`
+// directly — tsx's esbuild transform fails when invoked from inside a git
+// hook's stripped-down shell environment.
+const DIST_CLI_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", "cli.js");
 
 // Load this project's own .env by absolute path rather than relying on
 // dotenv's default of process.cwd() — cm can be invoked (e.g. from a git
@@ -456,7 +460,7 @@ function git(args) {
 }
 
 function cmSave(type, content) {
-  execFileSync("npx", ["tsx", CLI_PATH, "save", PROJECT, type, content], {
+  execFileSync("node", [CLI_PATH, "save", PROJECT, type, content], {
     stdio: "inherit",
   });
 }
@@ -636,7 +640,7 @@ async function cmdInit(project: string, targetPath: string) {
   nodeFs.mkdirSync(codingMemoryDir, { recursive: true });
 
   const hookLogicPath = nodePath.join(codingMemoryDir, "post-commit-hook.mjs");
-  nodeFs.writeFileSync(hookLogicPath, buildHookLogicScript(project, CLI_PATH), "utf-8");
+  nodeFs.writeFileSync(hookLogicPath, buildHookLogicScript(project, DIST_CLI_PATH), "utf-8");
 
   const hooksDir = nodePath.join(gitDir, "hooks");
   nodeFs.mkdirSync(hooksDir, { recursive: true });

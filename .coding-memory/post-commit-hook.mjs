@@ -2,14 +2,14 @@
 import { execFileSync } from "node:child_process";
 
 const PROJECT = "coding-memory";
-const CLI_PATH = "/Users/aruna/coding-memory/coding-memory/src/cli.ts";
+const CLI_PATH = "/Users/aruna/coding-memory/coding-memory/dist/cli.js";
 
 function git(args) {
   return execFileSync("git", args, { encoding: "utf-8" }).trim();
 }
 
 function cmSave(type, content) {
-  execFileSync("npx", ["tsx", CLI_PATH, "save", PROJECT, type, content], {
+  execFileSync("node", [CLI_PATH, "save", PROJECT, type, content], {
     stdio: "inherit",
   });
 }

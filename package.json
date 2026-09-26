@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "tsx src/index.ts",
+    "cli": "tsx src/cli.ts",
     "build": "tsc"
   },
   "keywords": [],
