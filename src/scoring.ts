@@ -273,3 +273,4 @@ export function scoreMemoryRelevance(memoryContent: string, task: string): numbe
 
   return containment * 0.7 + wordOverlapRatio * 0.3;
 }
+# TODO: fix the decay lambda value
