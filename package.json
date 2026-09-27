@@ -1,13 +1,16 @@
 {
   "name": "stackmem",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "",
   "main": "index.js",
   "type": "module",
   "bin": {
     "cm": "src/cli.ts"
   },
-  "files": ["dist", "src"],
+  "files": [
+    "dist",
+    "src"
+  ],
   "scripts": {
     "dev": "tsx src/index.ts",
     "cli": "tsx src/cli.ts",
