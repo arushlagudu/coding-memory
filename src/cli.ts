@@ -1,5 +1,6 @@
 #!/usr/bin/env tsx
 import nodeFs from "node:fs";
+import nodeOs from "node:os";
 import nodePath from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
@@ -24,6 +25,7 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 // directly — tsx's esbuild transform fails when invoked from inside a git
 // hook's stripped-down shell environment.
 const DIST_CLI_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", "cli.js");
+const DIST_INDEX_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", "index.js");
 
 const MEMORY_TYPES = ["decision", "rejection", "constraint", "discovery"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
@@ -648,6 +650,59 @@ for (const item of savedItems) {
 `;
 }
 
+function registerMcpServer(distIndexPath: string): void {
+  const claudeConfigPath = nodePath.join(nodeOs.homedir(), ".claude.json");
+
+  let config: { mcpServers?: Record<string, unknown> } = {};
+  if (nodeFs.existsSync(claudeConfigPath)) {
+    try {
+      config = JSON.parse(nodeFs.readFileSync(claudeConfigPath, "utf-8"));
+    } catch {
+      config = {};
+    }
+  }
+
+  if (!config.mcpServers || typeof config.mcpServers !== "object") {
+    config.mcpServers = {};
+  }
+
+  if (config.mcpServers.stackmem) {
+    return;
+  }
+
+  config.mcpServers.stackmem = {
+    command: "node",
+    args: [distIndexPath],
+  };
+
+  nodeFs.writeFileSync(claudeConfigPath, JSON.stringify(config, null, 2), "utf-8");
+  console.log("stackmem MCP server registered with Claude Code.");
+}
+
+function writeClaudeMd(project: string, resolvedPath: string): void {
+  const claudeMdPath = nodePath.join(resolvedPath, "CLAUDE.md");
+
+  if (nodeFs.existsSync(claudeMdPath)) {
+    console.log("CLAUDE.md already exists — skipping.");
+    return;
+  }
+
+  const content = `# stackmem
+
+At the start of every session, the stackmem MCP server will automatically load memories for this project. The project name is "${project}".
+
+If the MCP server is not connected, run:
+cm start ${project}
+and paste the output here before starting work.
+
+When you make a decision, discover a constraint, reject an approach, or make a discovery during this session, save it with:
+cm save ${project} <type> "<content>"
+`;
+
+  nodeFs.writeFileSync(claudeMdPath, content, "utf-8");
+  console.log("CLAUDE.md written.");
+}
+
 async function cmdInit(project: string, targetPath: string) {
   const resolvedPath = nodePath.resolve(targetPath);
   const gitDir = nodePath.join(resolvedPath, ".git");
@@ -671,6 +726,9 @@ async function cmdInit(project: string, targetPath: string) {
   nodeFs.chmodSync(hookPath, 0o755);
 
   console.log(`coding-memory hook installed for project ${project} at ${targetPath}`);
+
+  registerMcpServer(DIST_INDEX_PATH);
+  writeClaudeMd(project, resolvedPath);
 }
 
 // --- cm context ------------------------------------------------------------

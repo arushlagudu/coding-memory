@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
 
-const PROJECT = "coding-memory";
+const PROJECT = "testproject";
 const CLI_PATH = "/Users/aruna/coding-memory/coding-memory/dist/cli.js";
 
 function git(args) {
