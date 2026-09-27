@@ -3,9 +3,8 @@ import nodeFs from "node:fs";
 import nodePath from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface } from "node:readline/promises";
-import dotenv from "dotenv";
-import { createClient } from "@supabase/supabase-js";
 import { analyzeCodebase } from "./ast-index.js";
+import { getDeviceId } from "./device.js";
 import {
   applyContextBudget,
   buildSummaryContent,
@@ -16,6 +15,7 @@ import {
   estimateTokens,
   scoreMemoryRelevance,
 } from "./scoring.js";
+import { supabase } from "./storage.js";
 
 const CONTEXT_BUDGET_TOKENS = 2000;
 const COMPRESSION_THRESHOLD = 20;
@@ -24,23 +24,6 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 // directly — tsx's esbuild transform fails when invoked from inside a git
 // hook's stripped-down shell environment.
 const DIST_CLI_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", "cli.js");
-
-// Load this project's own .env by absolute path rather than relying on
-// dotenv's default of process.cwd() — cm can be invoked (e.g. from a git
-// post-commit hook via its full path) with the working directory set to
-// some other repo entirely.
-dotenv.config({ path: nodePath.join(nodePath.dirname(CLI_PATH), "..", ".env") });
-
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error(
-    "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable (check .env)."
-  );
-}
-
-const supabaseBaseUrl = SUPABASE_URL.replace(/\/rest\/v1\/?$/, "");
-const supabase = createClient(supabaseBaseUrl, SUPABASE_SERVICE_ROLE_KEY);
 
 const MEMORY_TYPES = ["decision", "rejection", "constraint", "discovery"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
@@ -245,6 +228,7 @@ async function cmdSave(project: string, type: string, content: string, force = f
     fail(`Invalid type "${type}". Must be one of: ${MEMORY_TYPES.join(", ")}`);
   }
 
+
   const { data: existingRows, error: existingError } = await supabase
     .from("memories")
     .select("id, content")
@@ -277,7 +261,7 @@ async function cmdSave(project: string, type: string, content: string, force = f
 
   const { data: inserted, error } = await supabase
     .from("memories")
-    .insert({ project, type, content })
+    .insert({ project, type, content, device_id: getDeviceId() })
     .select("id")
     .single();
 
@@ -340,7 +324,7 @@ async function compressMemories(
     const summaryContent = buildSummaryContent(cluster);
     const { error: insertError } = await supabase
       .from("memories")
-      .insert({ project, type: "discovery", content: summaryContent });
+      .insert({ project, type: "discovery", content: summaryContent, device_id: getDeviceId() });
 
     if (insertError) fail(`Failed to insert summary memory: ${insertError.message}`);
 
@@ -376,7 +360,7 @@ async function cmdCompress(project: string) {
 async function cmdFix(project: string, problem: string, solution: string) {
   const { error } = await supabase
     .from("execution_log")
-    .insert({ project, problem, solution, resolved: false });
+    .insert({ project, problem, solution, resolved: false, device_id: getDeviceId() });
 
   if (error) fail(`Failed to record fix: ${error.message}`);
 

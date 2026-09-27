@@ -1,5 +1,5 @@
 {
-  "name": "coding-memory",
+  "name": "stackmem",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -7,6 +7,7 @@
   "bin": {
     "cm": "src/cli.ts"
   },
+  "files": ["dist", "src"],
   "scripts": {
     "dev": "tsx src/index.ts",
     "cli": "tsx src/cli.ts",
@@ -19,7 +20,6 @@
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@supabase/supabase-js": "^2.116.0",
     "better-sqlite3": "^13.0.3",
-    "dotenv": "^17.4.2",
     "tree-sitter": "^0.21.1",
     "tree-sitter-javascript": "^0.23.1",
     "tree-sitter-typescript": "^0.23.2",

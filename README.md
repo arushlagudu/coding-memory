@@ -1,39 +1,22 @@
-# coding-memory
+# stackmem
 
 AI agents forget everything between sessions. Every new chat re-derives decisions, re-breaks constraints that were already settled, and re-debugs errors that were already fixed last week.
 
-coding-memory is a CLI and an MCP server that stores that context in Supabase and hands it back at the start of the next session. A git post-commit hook captures most of it automatically.
+stackmem is a CLI and an MCP server that stores that context in Supabase and hands it back at the start of the next session. A git post-commit hook captures most of it automatically.
 
 ## Install
 
 ```
-git clone https://github.com/arushlagudu/coding-memory.git
-cd coding-memory
-npm install
+npm install -g stackmem
 ```
 
-Create `.env`:
+Then in any git repo:
 
 ```
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+cm init <project> .
 ```
 
-Build and link:
-
-```
-npm run build
-sudo npm link
-sudo npm install -g tsx
-```
-
-`cm` is now on your PATH. Install the hook in a project:
-
-```
-$ cd your-project-directory
-$ cm init myapp .
-coding-memory hook installed for project myapp at .
-```
+That's it. No config, no accounts, no env file.
 
 ## Usage
 

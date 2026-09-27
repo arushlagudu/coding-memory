@@ -1,10 +1,9 @@
 #!/usr/bin/env node
-import "dotenv/config";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
+import { getDeviceId } from "./device.js";
 import {
   applyContextBudget,
   buildSummaryContent,
@@ -14,22 +13,10 @@ import {
   decideSaveAction,
   estimateTokens,
 } from "./scoring.js";
+import { supabase } from "./storage.js";
 
 const CONTEXT_BUDGET_TOKENS = 2000;
 const COMPRESSION_THRESHOLD = 20;
-
-const { SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY } = process.env;
-
-if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
-  throw new Error(
-    "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variable (check .env)."
-  );
-}
-
-// createClient wants the project base URL; strip a REST path if one was configured in .env.
-const supabaseBaseUrl = SUPABASE_URL.replace(/\/rest\/v1\/?$/, "");
-// Service-role key bypasses RLS — this server only runs locally/stdio-side, never exposed to a client.
-const supabase = createClient(supabaseBaseUrl, SUPABASE_SERVICE_ROLE_KEY);
 
 const server = new McpServer({
   name: "coding-memory",
@@ -164,7 +151,7 @@ async function compressMemories(
     const summaryContent = buildSummaryContent(cluster);
     const { error: insertError } = await supabase
       .from("memories")
-      .insert({ project, type: "discovery", content: summaryContent });
+      .insert({ project, type: "discovery", content: summaryContent, device_id: getDeviceId() });
 
     if (insertError) {
       throw new Error(`Failed to insert summary memory: ${insertError.message}`);
@@ -247,7 +234,7 @@ server.registerTool(
 
     const { data: inserted, error } = await supabase
       .from("memories")
-      .insert({ project, type, content })
+      .insert({ project, type, content, device_id: getDeviceId() })
       .select("id")
       .single();
 
@@ -309,6 +296,7 @@ server.registerTool(
   async ({ project, query }) => {
     void query;
 
+
     const { data, error } = await supabase
       .from("execution_log")
       .select("*")
@@ -343,7 +331,7 @@ server.registerTool(
   async ({ project, problem, solution }) => {
     const { error } = await supabase
       .from("execution_log")
-      .insert({ project, problem, solution, resolved: false });
+      .insert({ project, problem, solution, resolved: false, device_id: getDeviceId() });
 
     if (error) {
       throw new Error(`Failed to record fix: ${error.message}`);
