@@ -9,7 +9,7 @@ function git(args) {
 }
 
 function cmSave(type, content) {
-  execFileSync("node", [CLI_PATH, "save", PROJECT, type, content], {
+  execFileSync("node", [CLI_PATH, "save", PROJECT, type, content, "--force"], {
     stdio: "inherit",
   });
 }
