@@ -1,0 +1,76 @@
+{
+  "project": "coding-memory",
+  "exported_at": "2026-10-03T06:19:00.050Z",
+  "memories": [
+    {
+      "id": "d188416e-0ee2-4cce-a57f-b8c4b21c4edb",
+      "device_id": "fa7a0768-dffa-4668-9d58-05f0958a4557",
+      "project": "coding-memory",
+      "type": "decision",
+      "content": "feat: diff-first hierarchy, commit quality filter, first-commit fix",
+      "resolved": false,
+      "access_count": 2,
+      "created_at": "2026-10-03T05:18:49.848377"
+    },
+    {
+      "id": "7aa6ebcb-8aab-4938-8436-f54c37e18d73",
+      "device_id": "fa7a0768-dffa-4668-9d58-05f0958a4557",
+      "project": "coding-memory",
+      "type": "decision",
+      "content": "fix: add --force to git hook saves to prevent interactive prompts during commits",
+      "resolved": false,
+      "access_count": 2,
+      "created_at": "2026-09-27T04:25:30.631828"
+    },
+    {
+      "id": "807573c2-e0b3-4ca4-bd94-f9cb2fbea472",
+      "device_id": "fa7a0768-dffa-4668-9d58-05f0958a4557",
+      "project": "coding-memory",
+      "type": "decision",
+      "content": "feat: dynamic project name from .stackmem, fix init ordering, seed memories on init",
+      "resolved": false,
+      "access_count": 2,
+      "created_at": "2026-10-03T04:37:07.883716"
+    },
+    {
+      "id": "a5aab9dc-49b6-4bbc-aac2-5e65ace3e4ac",
+      "device_id": "fa7a0768-dffa-4668-9d58-05f0958a4557",
+      "project": "coding-memory",
+      "type": "decision",
+      "content": "feat: hosted Supabase backend, npm publish as stackmem, no env file required",
+      "resolved": false,
+      "access_count": 2,
+      "created_at": "2026-09-27T04:22:06.708442"
+    },
+    {
+      "id": "9b08b1f7-269c-49d0-a815-dcd53085f598",
+      "device_id": "fa7a0768-dffa-4668-9d58-05f0958a4557",
+      "project": "coding-memory",
+      "type": "decision",
+      "content": "built stripe webhook handler with error handling",
+      "resolved": false,
+      "access_count": 2,
+      "created_at": "2026-10-03T05:33:18.050205"
+    }
+  ],
+  "execution_log": [
+    {
+      "id": "e3600ccc-2b15-4b62-83cb-b111cb8477a2",
+      "device_id": "fa7a0768-dffa-4668-9d58-05f0958a4557",
+      "project": "coding-memory",
+      "problem": "webhook returned 400",
+      "solution": null,
+      "resolved": false,
+      "created_at": "2026-10-03T05:33:17.639237"
+    }
+  ],
+  "memory_links": [
+    {
+      "id": "da062352-41c2-4b7b-bd02-438d5be37c50",
+      "source_id": "807573c2-e0b3-4ca4-bd94-f9cb2fbea472",
+      "target_id": "a5aab9dc-49b6-4bbc-aac2-5e65ace3e4ac",
+      "score": 0.2,
+      "created_at": "2026-10-03T04:37:08.178326"
+    }
+  ]
+}

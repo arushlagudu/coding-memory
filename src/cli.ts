@@ -54,6 +54,10 @@ function usage(): never {
   cm init <project> <path>
   cm context [--project <name>] <task>
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
+  cm doctor
+  cm undo [project]
+  cm export [filename]
+  cm import [project] <filename>
   cm help
 
   [project] is optional if a .stackmem file exists in the current
@@ -125,6 +129,26 @@ function cmdHelp() {
       Accepts the same fields as JSON on stdin instead of flags
       (project, summary, errors_encountered, files_touched,
       approaches_tried) when stdin is piped rather than a terminal.
+
+  cm doctor
+      Check every integration point in the current directory — backend
+      connection, MCP registration, .stackmem, git hook, and memory
+      count — and report what's working and what's broken.
+
+  cm undo [project]
+      Delete the most recently saved unresolved memory (and any
+      memory_links referencing it) for a project.
+
+  cm export [filename]
+      Export all unresolved memories, execution_log entries, and
+      memory_links for a project to a JSON file. Defaults to
+      <project>-memories.json.
+
+  cm import [project] <filename>
+      Import memories and execution_log entries from a JSON file
+      produced by 'cm export'. Inserted under the current device_id
+      and project; memory_links are skipped and get rebuilt by
+      semantic linking the next time cm save runs.
 
   cm help
       Show this help message.`);
@@ -984,7 +1008,7 @@ async function cmdInit(project: string, targetPath: string) {
       `stackmem is live. Open Claude Code and ask "what do you know about this project?" to verify.`
     );
   } else {
-    console.log("✗ Backend connection failed — run 'cm doctor' (once we build it)");
+    console.log("✗ Backend connection failed — run 'cm doctor'");
   }
 
   // Written last and deliberately: if a commit (and hence the post-commit
@@ -1208,6 +1232,223 @@ async function cmdSessionEndEntry(args: string[]) {
   });
 }
 
+// --- cm doctor ---------------------------------------------------------
+
+async function cmdDoctor() {
+  let issues = 0;
+  const project = readProjectFromFile();
+
+  // 1. Backend connection
+  const backendOk = await verifyBackendConnection(project ?? "");
+  if (backendOk) {
+    console.log("✓ Backend connection verified");
+  } else {
+    console.log("✗ Backend connection failed — check your network");
+    issues++;
+  }
+
+  // 2. MCP server registration
+  const claudeConfigPath = nodePath.join(nodeOs.homedir(), ".claude.json");
+  let mcpRegistered = false;
+  if (nodeFs.existsSync(claudeConfigPath)) {
+    try {
+      const config = JSON.parse(nodeFs.readFileSync(claudeConfigPath, "utf-8"));
+      mcpRegistered = Boolean(config?.mcpServers?.stackmem);
+    } catch {
+      mcpRegistered = false;
+    }
+  }
+  if (mcpRegistered) {
+    console.log("✓ MCP server registered with Claude Code");
+  } else {
+    console.log("✗ MCP server not registered — run 'cm init <project> .'");
+    issues++;
+  }
+
+  // 3. Project file
+  if (project) {
+    console.log(`✓ Project file found: ${project}`);
+  } else {
+    console.log("✗ No .stackmem found — run 'cm init <project> .'");
+    issues++;
+  }
+
+  // 4. Git hook
+  const gitDir = nodePath.join(process.cwd(), ".git");
+  if (!nodeFs.existsSync(gitDir)) {
+    console.log("✗ No git repo found in current directory");
+    issues++;
+  } else {
+    const hookPath = nodePath.join(gitDir, "hooks", "post-commit");
+    let hookExecutable = false;
+    if (nodeFs.existsSync(hookPath)) {
+      try {
+        nodeFs.accessSync(hookPath, nodeFs.constants.X_OK);
+        hookExecutable = true;
+      } catch {
+        hookExecutable = false;
+      }
+    }
+    if (hookExecutable) {
+      console.log("✓ Git hook installed");
+    } else {
+      console.log("✗ Git hook not installed — run 'cm init <project> .'");
+      issues++;
+    }
+  }
+
+  // 5. Memory count
+  if (project) {
+    const { count, error } = await supabase
+      .from("memories")
+      .select("id", { count: "exact", head: true })
+      .eq("project", project)
+      .eq("resolved", false);
+
+    if (!error && (count ?? 0) > 0) {
+      console.log(`✓ ${count} memories stored for "${project}"`);
+    } else {
+      console.log(`✗ No memories yet — make a commit to start capturing`);
+      issues++;
+    }
+  } else {
+    console.log(`✗ No memories yet — make a commit to start capturing`);
+    issues++;
+  }
+
+  console.log("");
+  if (issues === 0) {
+    console.log("All systems operational.");
+  } else {
+    console.log(`${issues} issue(s) found. See above.`);
+  }
+}
+
+// --- cm undo -------------------------------------------------------------
+
+async function cmdUndo(project: string) {
+  const { data, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false)
+    .order("created_at", { ascending: false })
+    .limit(1);
+
+  if (error) fail(`Failed to load most recent memory: ${error.message}`);
+
+  const memory = (data ?? [])[0];
+  if (!memory) {
+    console.log("Nothing to undo.");
+    return;
+  }
+
+  const { error: linksError } = await supabase
+    .from("memory_links")
+    .delete()
+    .or(`source_id.eq.${memory.id},target_id.eq.${memory.id}`);
+
+  if (linksError) fail(`Failed to delete memory links: ${linksError.message}`);
+
+  const { error: deleteError } = await supabase.from("memories").delete().eq("id", memory.id);
+
+  if (deleteError) fail(`Failed to delete memory: ${deleteError.message}`);
+
+  console.log(`Undone: [${memory.type}] ${memory.content}`);
+}
+
+// --- cm export -------------------------------------------------------------
+
+async function cmdExport(project: string, filename?: string) {
+  const { data: memories, error: memoriesError } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (memoriesError) fail(`Failed to load memories: ${memoriesError.message}`);
+
+  const { data: executionLog, error: executionLogError } = await supabase
+    .from("execution_log")
+    .select("*")
+    .eq("project", project);
+
+  if (executionLogError) fail(`Failed to load execution log: ${executionLogError.message}`);
+
+  const memoryResults = memories ?? [];
+  const memoryIds = memoryResults.map((m) => m.id);
+
+  let memoryLinks: unknown[] = [];
+  if (memoryIds.length > 0) {
+    const idList = memoryIds.join(",");
+    const { data: links, error: linksError } = await supabase
+      .from("memory_links")
+      .select("*")
+      .or(`source_id.in.(${idList}),target_id.in.(${idList})`);
+
+    if (linksError) fail(`Failed to load memory links: ${linksError.message}`);
+    memoryLinks = links ?? [];
+  }
+
+  const exportData = {
+    project,
+    exported_at: new Date().toISOString(),
+    memories: memoryResults,
+    execution_log: executionLog ?? [],
+    memory_links: memoryLinks,
+  };
+
+  const outputFilename = filename ?? `${project}-memories.json`;
+  nodeFs.writeFileSync(outputFilename, JSON.stringify(exportData, null, 2), "utf-8");
+
+  console.log(`Exported ${memoryResults.length} memories to ${outputFilename}`);
+}
+
+// --- cm import -------------------------------------------------------------
+
+async function cmdImport(project: string, filename: string) {
+  if (!nodeFs.existsSync(filename)) {
+    console.log(`File not found: ${filename}`);
+    return;
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(nodeFs.readFileSync(filename, "utf-8"));
+  } catch (error) {
+    fail(`Failed to parse ${filename}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const memories = Array.isArray(parsed.memories) ? parsed.memories : [];
+  const executionLogEntries = Array.isArray(parsed.execution_log) ? parsed.execution_log : [];
+
+  // memory_links are intentionally skipped — they get rebuilt by semantic
+  // linking the next time cm save runs against the imported memories.
+
+  let importedCount = 0;
+  for (const memory of memories) {
+    const { error } = await supabase.from("memories").insert({
+      project,
+      type: memory.type,
+      content: memory.content,
+      device_id: getDeviceId(),
+    });
+    if (!error) importedCount++;
+  }
+
+  for (const entry of executionLogEntries) {
+    await supabase.from("execution_log").insert({
+      project,
+      problem: entry.problem,
+      solution: entry.solution ?? null,
+      resolved: entry.resolved ?? false,
+      device_id: getDeviceId(),
+    });
+  }
+
+  console.log(`Imported ${importedCount} memories from ${filename}`);
+}
+
 // --- main --------------------------------------------------------------
 
 async function main() {
@@ -1305,6 +1546,32 @@ async function main() {
     }
     case "session-end": {
       await cmdSessionEndEntry(args);
+      break;
+    }
+    case "doctor": {
+      await cmdDoctor();
+      break;
+    }
+    case "undo": {
+      const split = splitOptionalProject(args, 0);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      await cmdUndo(project);
+      break;
+    }
+    case "export": {
+      if (args.length > 1) usage();
+      const [filename] = args;
+      const project = requireProject(null);
+      await cmdExport(project, filename);
+      break;
+    }
+    case "import": {
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [filename] = split.rest;
+      await cmdImport(project, filename);
       break;
     }
     case "help": {
