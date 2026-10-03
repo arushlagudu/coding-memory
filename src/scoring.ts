@@ -247,6 +247,57 @@ export function buildSummaryContent(cluster: any[]): string {
   return `[${mostCommonType.toUpperCase()} cluster] ${topic}: ${items}`;
 }
 
+// --- message quality filter ------------------------------------------------
+
+const LOW_QUALITY_PREFIXES = [
+  "wip", "fix", "update", "misc", "temp", "test", "patch", "minor",
+  "tweak", "change", "stuff", "done", "commit", "save", "ok", "m", "x",
+];
+
+const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+
+// Filters out lazy/placeholder messages ("wip", "fix", "m", "...") and bare
+// version bumps ("1.0.4"). Checked against the first word (and the whole
+// message), not a raw prefix match, so a real message like "Migrate auth to
+// JWT" isn't rejected just for starting with the letter "m". The git hook
+// keeps its own inline copy of this same logic since it runs as a standalone
+// script with no access to this module — keep the two in sync by hand if
+// this changes.
+export function isQualityMessage(message: string): boolean {
+  const trimmed = message.trim();
+  if (trimmed.length < 15) return false;
+  if (SEMVER_RE.test(trimmed)) return false;
+  if (!trimmed.includes(" ")) return false;
+
+  const stripped = trimmed.replace(/\s/g, "");
+  if (stripped.length > 0 && new Set(stripped).size === 1) return false;
+
+  const lowerTrimmed = trimmed.toLowerCase();
+  if (LOW_QUALITY_PREFIXES.includes(lowerTrimmed)) return false;
+
+  const firstWord = (lowerTrimmed.match(/^[a-z0-9]+/) || [""])[0];
+  if (LOW_QUALITY_PREFIXES.includes(firstWord)) return false;
+
+  return true;
+}
+
+// --- session-end classification ---------------------------------------------
+
+const FAILURE_PHRASES = ["failed", "didn't work", "reverted", "switched away"];
+
+export function indicatesFailedApproach(text: string): boolean {
+  const lower = text.toLowerCase();
+  return FAILURE_PHRASES.some((phrase) => lower.includes(phrase));
+}
+
+export function isAuthRelatedFile(filePath: string): boolean {
+  return /(auth|login|session|token)/i.test(filePath);
+}
+
+export function isCodeFile(filePath: string): boolean {
+  return /\.(ts|js)$/i.test(filePath);
+}
+
 // --- task relevance --------------------------------------------------------
 
 function splitWords(text: string): string[] {

@@ -52,13 +52,17 @@ const LOW_QUALITY_PREFIXES = [
   "tweak", "change", "stuff", "done", "commit", "save", "ok", "m", "x",
 ];
 
+const SEMVER_RE = /^\d+\.\d+\.\d+$/;
+
 // Filters out lazy/placeholder commit messages ("wip", "fix", "m", "...")
-// so only messages worth remembering become decisions. Checked against the
-// first word, not a raw prefix match, so a real message like "Migrate auth
-// to JWT" isn't rejected just for starting with the letter "m".
+// and bare version bumps ("1.0.4") so only messages worth remembering
+// become decisions. Checked against the first word, not a raw prefix
+// match, so a real message like "Migrate auth to JWT" isn't rejected just
+// for starting with the letter "m".
 function isQualityCommitMessage(message) {
   const trimmed = message.trim();
-  if (trimmed.length <= 20) return false;
+  if (trimmed.length < 15) return false;
+  if (SEMVER_RE.test(trimmed)) return false;
   if (!trimmed.includes(" ")) return false;
 
   const stripped = trimmed.replace(/\s/g, "");

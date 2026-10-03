@@ -12,6 +12,10 @@ import {
   computeMemoryLinks,
   decideSaveAction,
   estimateTokens,
+  indicatesFailedApproach,
+  isAuthRelatedFile,
+  isCodeFile,
+  isQualityMessage,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
 
@@ -418,6 +422,89 @@ server.registerTool(
         { type: "text", text: `${deps.file_path} imports ${deps.imports.length} module(s).` },
       ],
       structuredContent: deps,
+    };
+  }
+);
+
+// --- session_end -----------------------------------------------------------
+
+server.registerTool(
+  "session_end",
+  {
+    title: "Session End",
+    description:
+      "Capture what happened during a coding session and automatically extract memories: unsolved errors, failed approaches, a summary decision, auth-file touches, and an AST re-index.",
+    inputSchema: {
+      project: z.string().describe("Project identifier"),
+      files_touched: z.array(z.string()).describe("Files read or modified during the session"),
+      errors_encountered: z.array(z.string()).describe("Error messages encountered during the session"),
+      approaches_tried: z
+        .array(z.string())
+        .optional()
+        .describe("Things that were attempted during the session"),
+      summary: z.string().optional().describe("One sentence describing what was accomplished"),
+    },
+  },
+  async ({ project, files_touched, errors_encountered, approaches_tried, summary }) => {
+    let memoriesSaved = 0;
+    let errorsLogged = 0;
+
+    for (const problem of errors_encountered) {
+      const { error } = await supabase.from("execution_log").insert({
+        project,
+        problem,
+        solution: null,
+        resolved: false,
+        device_id: getDeviceId(),
+      });
+      if (!error) errorsLogged++;
+    }
+
+    for (const approach of approaches_tried ?? []) {
+      if (!indicatesFailedApproach(approach)) continue;
+      const { error } = await supabase.from("memories").insert({
+        project,
+        type: "rejection",
+        content: approach,
+        device_id: getDeviceId(),
+      });
+      if (!error) memoriesSaved++;
+    }
+
+    if (summary && isQualityMessage(summary)) {
+      const { error } = await supabase.from("memories").insert({
+        project,
+        type: "decision",
+        content: summary.trim(),
+        device_id: getDeviceId(),
+      });
+      if (!error) memoriesSaved++;
+    }
+
+    const authFiles = files_touched.filter(isAuthRelatedFile);
+    if (authFiles.length > 0) {
+      const { error } = await supabase.from("memories").insert({
+        project,
+        type: "discovery",
+        content: `session touched auth files: ${authFiles.join(", ")}`,
+        device_id: getDeviceId(),
+      });
+      if (!error) memoriesSaved++;
+    }
+
+    if (files_touched.some(isCodeFile)) {
+      analyzeCodebase(process.cwd());
+    }
+
+    const message = `Session captured. ${memoriesSaved} memories saved.`;
+
+    return {
+      content: [{ type: "text", text: message }],
+      structuredContent: {
+        memories_saved: memoriesSaved,
+        errors_logged: errorsLogged,
+        message,
+      },
     };
   }
 );

@@ -14,6 +14,10 @@ import {
   computeMemoryLinks,
   decideSaveAction,
   estimateTokens,
+  indicatesFailedApproach,
+  isAuthRelatedFile,
+  isCodeFile,
+  isQualityMessage,
   scoreMemoryRelevance,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
@@ -43,16 +47,19 @@ function usage(): never {
   cm save [project] <type> <content> [--force]  (type: decision|rejection|constraint|discovery)
   cm fix [project] <problem> <solution>
   cm analyze [project] <path>
-  cm search [project] <query>
+  cm search [--project <name>] <query>
   cm resolve [project] <memory-id>
   cm delete [project] <memory-id>
   cm compress [project]
   cm init <project> <path>
-  cm context [project] <task>
+  cm context [--project <name>] <task>
+  cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
   cm help
 
   [project] is optional if a .stackmem file exists in the current
-  directory (written by 'cm init'). Otherwise it must be given explicitly.`);
+  directory (written by 'cm init'). Otherwise it must be given explicitly.
+  search/context take --project instead of a positional project, since a
+  bare query/task can't otherwise be told apart from a project name.`);
   process.exit(1);
 }
 
@@ -82,9 +89,10 @@ function cmdHelp() {
       Build an AST index (files, functions, classes) for the codebase
       at <path>.
 
-  cm search [project] <query>
+  cm search [--project <name>] <query>
       Search saved memories and past fixes for a project matching
-      <query>.
+      <query>. The whole query is always the full remaining text — use
+      --project to search a project other than the one in .stackmem.
 
   cm resolve [project] <memory-id>
       Mark a memory as resolved.
@@ -101,10 +109,22 @@ function cmdHelp() {
       the stackmem MCP server with Claude Code, write a CLAUDE.md and
       .stackmem file, and seed initial memories from the project scan.
 
-  cm context [project] <task>
+  cm context [--project <name>] <task>
       Return only the top 5 memories most relevant to a specific
       task, ranked by a blend of task relevance and decay score,
-      as a markdown block capped at a 2000 token budget.
+      as a markdown block capped at a 2000 token budget. Use
+      --project to target a project other than the one in .stackmem.
+
+  cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
+      Capture what happened in a session and extract memories: each
+      error becomes an unsolved execution_log entry, each approach
+      containing "failed", "didn't work", "reverted", or "switched
+      away" becomes a rejection, a summary that passes the quality
+      filter becomes a decision, auth-related files become a
+      discovery, and any .ts/.js file triggers an AST re-index.
+      Accepts the same fields as JSON on stdin instead of flags
+      (project, summary, errors_encountered, files_touched,
+      approaches_tried) when stdin is piped rather than a terminal.
 
   cm help
       Show this help message.`);
@@ -126,7 +146,22 @@ function readProjectFromFile(): string | null {
   return content.length > 0 ? content : null;
 }
 
+// Catches the common habit-slip of typing `cm fix . "problem" "solution"` by
+// muscle memory from `cm init <project> .` — "." (or "..", or anything
+// path-shaped) is never a real project name, so an explicit arg this shape
+// almost certainly means the caller meant to omit the project entirely.
+function looksLikeAPath(value: string): boolean {
+  return value === "." || value === ".." || value.includes("/") || value.includes("\\");
+}
+
 function requireProject(explicit: string | null): string {
+  if (explicit && looksLikeAPath(explicit)) {
+    console.error(
+      `Warning: '${explicit}' is not a valid project name — reading from .stackmem instead.`
+    );
+    explicit = null;
+  }
+
   if (explicit) return explicit;
 
   const fromFile = readProjectFromFile();
@@ -154,12 +189,23 @@ function splitOptionalProject(
 // arg count can't disambiguate an omitted project from a multi-word query —
 // "cm search bug fix" is ambiguous by count alone. Use .stackmem's presence
 // instead: if it exists, nothing is positionally a project.
+// Arg count can't disambiguate an omitted project from a multi-word query —
+// "cm search bug fix" is ambiguous by count alone. Treating .stackmem's mere
+// presence as "project omitted" (the previous approach) was worse: it
+// silently swallowed an explicit project into the query text whenever a
+// .stackmem file happened to exist in cwd, so "cm search otherproj auth bug"
+// would search project X (from .stackmem) for the literal text "otherproj
+// auth bug" with no error. Positional args are now always the full
+// query/task; an explicit override uses --project <name> instead, which is
+// never ambiguous and is never silently absorbed.
 function splitProjectFromVariadic(args: string[]): { project: string | null; rest: string[] } {
-  if (readProjectFromFile() !== null) {
-    return { project: null, rest: args };
+  const flagIndex = args.indexOf("--project");
+  if (flagIndex !== -1 && args[flagIndex + 1] !== undefined) {
+    const project = args[flagIndex + 1];
+    const rest = [...args.slice(0, flagIndex), ...args.slice(flagIndex + 2)];
+    return { project, rest };
   }
-  const [project = null, ...rest] = args;
-  return { project, rest };
+  return { project: null, rest: args };
 }
 
 // --- cm start ----------------------------------------------------------
@@ -578,13 +624,17 @@ const LOW_QUALITY_PREFIXES = [
   "tweak", "change", "stuff", "done", "commit", "save", "ok", "m", "x",
 ];
 
+const SEMVER_RE = /^\\d+\\.\\d+\\.\\d+$/;
+
 // Filters out lazy/placeholder commit messages ("wip", "fix", "m", "...")
-// so only messages worth remembering become decisions. Checked against the
-// first word, not a raw prefix match, so a real message like "Migrate auth
-// to JWT" isn't rejected just for starting with the letter "m".
+// and bare version bumps ("1.0.4") so only messages worth remembering
+// become decisions. Checked against the first word, not a raw prefix
+// match, so a real message like "Migrate auth to JWT" isn't rejected just
+// for starting with the letter "m".
 function isQualityCommitMessage(message) {
   const trimmed = message.trim();
-  if (trimmed.length <= 20) return false;
+  if (trimmed.length < 15) return false;
+  if (SEMVER_RE.test(trimmed)) return false;
   if (!trimmed.includes(" ")) return false;
 
   const stripped = trimmed.replace(/\\s/g, "");
@@ -999,6 +1049,165 @@ async function cmdContext(project: string, task: string) {
   console.log(lines.join("\n"));
 }
 
+// --- cm session-end --------------------------------------------------------
+
+interface SessionEndInput {
+  project: string | null;
+  summary?: string;
+  errors: string[];
+  files: string[];
+  approaches: string[];
+}
+
+function splitCommaList(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+// Flags only — stdin JSON is handled separately in cmdSessionEndEntry, since
+// it carries its own full shape (arrays, not comma-joined strings).
+function parseSessionEndFlags(args: string[]): SessionEndInput {
+  let project: string | null = null;
+  let summary: string | undefined;
+  let errors: string[] = [];
+  let files: string[] = [];
+  let approaches: string[] = [];
+
+  let i = 0;
+  if (args[i] && !args[i].startsWith("--")) {
+    project = args[i];
+    i++;
+  }
+
+  for (; i < args.length; i++) {
+    const flag = args[i];
+    const value = args[i + 1];
+    if (flag === "--summary") {
+      summary = value;
+      i++;
+    } else if (flag === "--errors") {
+      errors = splitCommaList(value);
+      i++;
+    } else if (flag === "--files") {
+      files = splitCommaList(value);
+      i++;
+    } else if (flag === "--approaches") {
+      approaches = splitCommaList(value);
+      i++;
+    }
+  }
+
+  return { project, summary, errors, files, approaches };
+}
+
+async function readStdinJson(): Promise<Record<string, unknown> | null> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) {
+    chunks.push(chunk as Buffer);
+  }
+  const raw = Buffer.concat(chunks).toString("utf-8").trim();
+  if (!raw) return null;
+
+  try {
+    const parsed = JSON.parse(raw);
+    return typeof parsed === "object" && parsed !== null ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cmdSessionEnd(project: string, input: Omit<SessionEndInput, "project">) {
+  let memoriesSaved = 0;
+  let errorsLogged = 0;
+
+  for (const problem of input.errors) {
+    const { error } = await supabase.from("execution_log").insert({
+      project,
+      problem,
+      solution: null,
+      resolved: false,
+      device_id: getDeviceId(),
+    });
+    if (!error) errorsLogged++;
+  }
+
+  for (const approach of input.approaches) {
+    if (!indicatesFailedApproach(approach)) continue;
+    const { error } = await supabase.from("memories").insert({
+      project,
+      type: "rejection",
+      content: approach,
+      device_id: getDeviceId(),
+    });
+    if (!error) memoriesSaved++;
+  }
+
+  if (input.summary && isQualityMessage(input.summary)) {
+    const { error } = await supabase.from("memories").insert({
+      project,
+      type: "decision",
+      content: input.summary.trim(),
+      device_id: getDeviceId(),
+    });
+    if (!error) memoriesSaved++;
+  }
+
+  const authFiles = input.files.filter(isAuthRelatedFile);
+  if (authFiles.length > 0) {
+    const { error } = await supabase.from("memories").insert({
+      project,
+      type: "discovery",
+      content: `session touched auth files: ${authFiles.join(", ")}`,
+      device_id: getDeviceId(),
+    });
+    if (!error) memoriesSaved++;
+  }
+
+  if (input.files.some(isCodeFile)) {
+    analyzeCodebase(process.cwd());
+  }
+
+  console.log(`Session captured. ${memoriesSaved} memories saved.`);
+  if (errorsLogged > 0) {
+    console.log(`${errorsLogged} error(s) logged to execution_log.`);
+  }
+}
+
+// Dispatches to JSON-from-stdin or flag parsing depending on how the
+// command was invoked — piped input (e.g. from a script) uses JSON; an
+// interactive terminal with no piped stdin uses flags.
+async function cmdSessionEndEntry(args: string[]) {
+  let input: SessionEndInput;
+
+  if (!process.stdin.isTTY) {
+    const json = await readStdinJson();
+    if (json) {
+      input = {
+        project: typeof json.project === "string" ? json.project : null,
+        summary: typeof json.summary === "string" ? json.summary : undefined,
+        errors: Array.isArray(json.errors_encountered) ? json.errors_encountered : [],
+        files: Array.isArray(json.files_touched) ? json.files_touched : [],
+        approaches: Array.isArray(json.approaches_tried) ? json.approaches_tried : [],
+      };
+    } else {
+      input = parseSessionEndFlags(args);
+    }
+  } else {
+    input = parseSessionEndFlags(args);
+  }
+
+  const project = requireProject(input.project);
+  await cmdSessionEnd(project, {
+    summary: input.summary,
+    errors: input.errors,
+    files: input.files,
+    approaches: input.approaches,
+  });
+}
+
 // --- main --------------------------------------------------------------
 
 async function main() {
@@ -1092,6 +1301,10 @@ async function main() {
       const project = requireProject(split.project);
       if (split.rest.length === 0) usage();
       await cmdContext(project, split.rest.join(" "));
+      break;
+    }
+    case "session-end": {
+      await cmdSessionEndEntry(args);
       break;
     }
     case "help": {

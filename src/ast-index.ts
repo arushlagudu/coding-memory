@@ -217,12 +217,23 @@ export function analyzeCodebase(projectPath: string): AnalyzeCodebaseResult {
   const insertImport = db.prepare("INSERT INTO imports (file_id, source) VALUES (?, ?)");
 
   const files = walkProjectFiles(resolvedProjectPath);
+  let filesIndexed = 0;
   let totalFunctions = 0;
   let totalClasses = 0;
 
   const runAll = db.transaction((filePaths: string[]) => {
     for (const filePath of filePaths) {
-      const extraction = extractFile(filePath, resolvedProjectPath);
+      let extraction: FileExtraction;
+      try {
+        extraction = extractFile(filePath, resolvedProjectPath);
+      } catch {
+        // Tree-sitter (or the file read) choked on this file — better-sqlite3
+        // transactions roll back entirely on a throw, so skipping here
+        // (rather than letting it propagate) is what keeps one bad file from
+        // wiping out every other file already processed in this run.
+        continue;
+      }
+
       const row = insertFile.get(
         extraction.relativePath,
         path.basename(extraction.relativePath),
@@ -245,6 +256,8 @@ export function analyzeCodebase(projectPath: string): AnalyzeCodebaseResult {
       for (const source of extraction.imports) {
         insertImport.run(fileId, source);
       }
+
+      filesIndexed++;
     }
   });
 
@@ -252,7 +265,7 @@ export function analyzeCodebase(projectPath: string): AnalyzeCodebaseResult {
   db.close();
 
   return {
-    files_indexed: files.length,
+    files_indexed: filesIndexed,
     functions: totalFunctions,
     classes: totalClasses,
   };
