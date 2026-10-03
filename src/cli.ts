@@ -573,21 +573,60 @@ function isSchemaFile(filePath) {
   );
 }
 
+const LOW_QUALITY_PREFIXES = [
+  "wip", "fix", "update", "misc", "temp", "test", "patch", "minor",
+  "tweak", "change", "stuff", "done", "commit", "save", "ok", "m", "x",
+];
+
+// Filters out lazy/placeholder commit messages ("wip", "fix", "m", "...")
+// so only messages worth remembering become decisions. Checked against the
+// first word, not a raw prefix match, so a real message like "Migrate auth
+// to JWT" isn't rejected just for starting with the letter "m".
+function isQualityCommitMessage(message) {
+  const trimmed = message.trim();
+  if (trimmed.length <= 20) return false;
+  if (!trimmed.includes(" ")) return false;
+
+  const stripped = trimmed.replace(/\\s/g, "");
+  if (stripped.length > 0 && new Set(stripped).size === 1) return false;
+
+  const lowerTrimmed = trimmed.toLowerCase();
+  if (LOW_QUALITY_PREFIXES.includes(lowerTrimmed)) return false;
+
+  const firstWord = (lowerTrimmed.match(/^[a-z0-9]+/) || [""])[0];
+  if (LOW_QUALITY_PREFIXES.includes(firstWord)) return false;
+
+  return true;
+}
+
 const savedItems = [];
 
 const commitMessage = git(["log", "-1", "--pretty=%B"]);
-cmSave("decision", commitMessage);
-savedItems.push(\`decision: \${commitMessage}\`);
 
-const changedFiles = git(["diff-tree", "--no-commit-id", "-r", "--name-only", "HEAD"])
+const isFirstCommit = (() => {
+  try {
+    execFileSync("git", ["rev-parse", "HEAD~1"], { stdio: "pipe" });
+    return false;
+  } catch {
+    return true;
+  }
+})();
+
+const changedFiles = git(
+  isFirstCommit
+    ? ["diff-tree", "--root", "--no-commit-id", "-r", "--name-only", "HEAD"]
+    : ["diff-tree", "--no-commit-id", "-r", "--name-only", "HEAD"]
+)
   .split("\\n")
   .filter(Boolean);
 
 let diff = "";
-try {
-  diff = execFileSync("git", ["diff", "HEAD~1", "HEAD"], { encoding: "utf-8" });
-} catch {
-  diff = "";
+if (!isFirstCommit) {
+  try {
+    diff = execFileSync("git", ["diff", "HEAD~1", "HEAD"], { encoding: "utf-8" });
+  } catch {
+    diff = "";
+  }
 }
 
 const lines = diff.split("\\n");
@@ -595,7 +634,7 @@ let currentFile = null;
 let isNewFile = false;
 let inDependenciesSection = false;
 
-for (const line of lines) {
+for (const line of isFirstCommit ? [] : lines) {
   if (line.startsWith("diff --git")) {
     isNewFile = false;
     inDependenciesSection = false;
@@ -645,10 +684,20 @@ for (const line of lines) {
   if (line.startsWith("-") && !line.startsWith("---")) {
     const codeLine = line.slice(1).trim();
 
-    if (codeLine.startsWith("import") || codeLine.startsWith("require")) {
-      const pathMatch = codeLine.match(/['"]([^'"]+)['"]/);
-      const importPath = pathMatch ? pathMatch[1] : codeLine;
-      const content = \`removed dependency: \${importPath}\`;
+    const importMatch = line.match(
+      /^-\\s*(import\\s+.*\\s+from\\s+['"]([^'"]+)['"]|import\\s+['"]([^'"]+)['"])/
+    );
+    const requireMatch = line.match(
+      /^-\\s*(?:const|let|var)\\s+\\S+\\s*=\\s*require\\(['"]([^'"]+)['"]\\)/
+    );
+    const removedModulePath = importMatch
+      ? importMatch[2] || importMatch[3]
+      : requireMatch
+        ? requireMatch[1]
+        : null;
+
+    if (removedModulePath) {
+      const content = \`removed dependency: \${removedModulePath}\`;
       cmSave("rejection", content);
       savedItems.push(\`rejection: \${content}\`);
     }
@@ -702,6 +751,14 @@ for (const line of lines) {
       savedItems.push(\`discovery: \${content}\`);
     }
   }
+}
+
+// Saved last, after every diff-detected memory, and only if it clears the
+// quality filter — diff analysis always runs regardless of commit message.
+if (isQualityCommitMessage(commitMessage)) {
+  const trimmedMessage = commitMessage.trim();
+  cmSave("decision", trimmedMessage);
+  savedItems.push(\`decision: \${trimmedMessage}\`);
 }
 
 console.log(\`coding-memory post-commit summary (\${changedFiles.length} file(s) changed):\`);
