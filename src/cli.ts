@@ -39,64 +39,69 @@ const TYPE_LABELS: Record<MemoryType, string> = {
 
 function usage(): never {
   console.error(`Usage:
-  cm start <project>
-  cm save <project> <type> <content> [--force]  (type: decision|rejection|constraint|discovery)
-  cm fix <project> <problem> <solution>
-  cm analyze <project> <path>
-  cm search <project> <query>
-  cm resolve <project> <memory-id>
-  cm delete <project> <memory-id>
-  cm compress <project>
+  cm start [project]
+  cm save [project] <type> <content> [--force]  (type: decision|rejection|constraint|discovery)
+  cm fix [project] <problem> <solution>
+  cm analyze [project] <path>
+  cm search [project] <query>
+  cm resolve [project] <memory-id>
+  cm delete [project] <memory-id>
+  cm compress [project]
   cm init <project> <path>
-  cm context <project> <task>
-  cm help`);
+  cm context [project] <task>
+  cm help
+
+  [project] is optional if a .stackmem file exists in the current
+  directory (written by 'cm init'). Otherwise it must be given explicitly.`);
   process.exit(1);
 }
 
 function cmdHelp() {
   console.log(`cm — coding memory CLI
 
-  cm start <project>
+  [project] is optional everywhere below if a .stackmem file exists in
+  the current directory (written by 'cm init'). Otherwise pass it explicitly.
+
+  cm start [project]
       Load all unresolved memories for a project, sorted by decay
       score and capped at a 2000 token context budget, grouped by
       type (decisions, constraints, discoveries, rejections), with
       linked memory ids shown under each entry.
 
-  cm save <project> <type> <content> [--force]
+  cm save [project] <type> <content> [--force]
       Save a new memory. <type> is one of: decision, rejection,
       constraint, discovery. Automatically links to related existing
       memories. If the new memory contradicts an existing one, prompts
       to keep the old memory or replace it — pass --force to skip the
       prompt and always replace.
 
-  cm fix <project> <problem> <solution>
+  cm fix [project] <problem> <solution>
       Record a problem and its solution for future reference.
 
-  cm analyze <project> <path>
+  cm analyze [project] <path>
       Build an AST index (files, functions, classes) for the codebase
       at <path>.
 
-  cm search <project> <query>
+  cm search [project] <query>
       Search saved memories and past fixes for a project matching
       <query>.
 
-  cm resolve <project> <memory-id>
+  cm resolve [project] <memory-id>
       Mark a memory as resolved.
 
-  cm delete <project> <memory-id>
+  cm delete [project] <memory-id>
       Delete a memory and any memory_links referencing it.
 
-  cm compress <project>
+  cm compress [project]
       Cluster related unresolved memories (needs 20+) and collapse
       clusters of 3 or more into a single summary memory.
 
   cm init <project> <path>
-      Install a git post-commit hook in the repo at <path> that
-      records the commit message and any implicit memories (removed
-      imports, new env vars, new auth-related files) after every
-      commit.
+      Install a git post-commit hook in the repo at <path>, register
+      the stackmem MCP server with Claude Code, write a CLAUDE.md and
+      .stackmem file, and seed initial memories from the project scan.
 
-  cm context <project> <task>
+  cm context [project] <task>
       Return only the top 5 memories most relevant to a specific
       task, ranked by a blend of task relevance and decay score,
       as a markdown block capped at a 2000 token budget.
@@ -108,6 +113,53 @@ function cmdHelp() {
 function fail(message: string): never {
   console.error(`Error: ${message}`);
   process.exit(1);
+}
+
+// --- optional project resolution ------------------------------------------
+
+const STACKMEM_FILE = ".stackmem";
+
+function readProjectFromFile(): string | null {
+  const stackmemPath = nodePath.join(process.cwd(), STACKMEM_FILE);
+  if (!nodeFs.existsSync(stackmemPath)) return null;
+  const content = nodeFs.readFileSync(stackmemPath, "utf-8").trim();
+  return content.length > 0 ? content : null;
+}
+
+function requireProject(explicit: string | null): string {
+  if (explicit) return explicit;
+
+  const fromFile = readProjectFromFile();
+  if (fromFile) return fromFile;
+
+  console.error(
+    "No project specified and no .stackmem file found. Run 'cm init <project> .' first or pass a project name."
+  );
+  process.exit(1);
+}
+
+// For commands whose non-project args have a fixed count: if exactly that
+// many args are given, project was omitted; if one more, the first is the
+// project. Anything else is a usage error.
+function splitOptionalProject(
+  args: string[],
+  fixedArgCount: number
+): { project: string | null; rest: string[] } | null {
+  if (args.length === fixedArgCount) return { project: null, rest: args };
+  if (args.length === fixedArgCount + 1) return { project: args[0], rest: args.slice(1) };
+  return null;
+}
+
+// For commands whose remaining arg is free-form text (a query or task),
+// arg count can't disambiguate an omitted project from a multi-word query —
+// "cm search bug fix" is ambiguous by count alone. Use .stackmem's presence
+// instead: if it exists, nothing is positionally a project.
+function splitProjectFromVariadic(args: string[]): { project: string | null; rest: string[] } {
+  if (readProjectFromFile() !== null) {
+    return { project: null, rest: args };
+  }
+  const [project = null, ...rest] = args;
+  return { project, rest };
 }
 
 // --- cm start ----------------------------------------------------------
@@ -471,11 +523,20 @@ async function cmdDelete(project: string, memoryId: string) {
 // .git/hooks/post-commit) so its module type is unambiguous — an
 // extensionless file run by git would otherwise have its CommonJS/ESM
 // interpretation depend on the target repo's own package.json.
-function buildHookLogicScript(project: string, cliPath: string): string {
+function buildHookLogicScript(cliPath: string): string {
   return `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
-const PROJECT = ${JSON.stringify(project)};
+const stackmemPath = join(process.cwd(), ".stackmem");
+let PROJECT;
+try {
+  PROJECT = readFileSync(stackmemPath, "utf8").trim();
+} catch {
+  process.exit(0); // no .stackmem, skip silently
+}
+
 const CLI_PATH = ${JSON.stringify(cliPath)};
 
 function git(args) {
@@ -703,6 +764,75 @@ cm save ${project} <type> "<content>"
   console.log("CLAUDE.md written.");
 }
 
+function writeProjectFile(project: string, resolvedPath: string): void {
+  const stackmemPath = nodePath.join(resolvedPath, STACKMEM_FILE);
+  nodeFs.writeFileSync(stackmemPath, `${project}\n`, "utf-8");
+}
+
+// Scans the freshly-initialized project for a few cheap, high-signal facts
+// and saves them as memories directly (bypassing cmdSave's duplicate/conflict
+// prompt — there's nothing to conflict with yet, and init must stay
+// non-interactive). Returns how many memories were actually saved.
+async function seedMemories(project: string, resolvedPath: string): Promise<number> {
+  let seededCount = 0;
+
+  const packageJsonPath = nodePath.join(resolvedPath, "package.json");
+  if (nodeFs.existsSync(packageJsonPath)) {
+    try {
+      const pkg = JSON.parse(nodeFs.readFileSync(packageJsonPath, "utf-8"));
+      const depNames = [
+        ...Object.keys(pkg.dependencies ?? {}),
+        ...Object.keys(pkg.devDependencies ?? {}),
+      ];
+      if (depNames.length > 0) {
+        const { error } = await supabase.from("memories").insert({
+          project,
+          type: "discovery",
+          content: `tech stack: ${depNames.join(", ")}`,
+          device_id: getDeviceId(),
+        });
+        if (!error) seededCount++;
+      }
+    } catch {
+      // Malformed package.json — skip the tech-stack memory.
+    }
+  }
+
+  const envExamplePath = nodePath.join(resolvedPath, ".env.example");
+  if (nodeFs.existsSync(envExamplePath)) {
+    const varNames = nodeFs
+      .readFileSync(envExamplePath, "utf-8")
+      .split("\n")
+      .filter((line) => /^[A-Z_]+=/.test(line))
+      .map((line) => line.split("=")[0]);
+
+    if (varNames.length > 0) {
+      const { error } = await supabase.from("memories").insert({
+        project,
+        type: "constraint",
+        content: `required env vars: ${varNames.join(", ")}`,
+        device_id: getDeviceId(),
+      });
+      if (!error) seededCount++;
+    }
+  }
+
+  analyzeCodebase(resolvedPath);
+
+  return seededCount;
+}
+
+// Smoke-tests the same anon-key + device-header path session_start/cmdStart
+// use, without pulling in all of cmdStart's scoring/formatting logic.
+async function verifyBackendConnection(project: string): Promise<boolean> {
+  const { error } = await supabase
+    .from("memories")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project);
+
+  return !error;
+}
+
 async function cmdInit(project: string, targetPath: string) {
   const resolvedPath = nodePath.resolve(targetPath);
   const gitDir = nodePath.join(resolvedPath, ".git");
@@ -716,7 +846,7 @@ async function cmdInit(project: string, targetPath: string) {
   nodeFs.mkdirSync(codingMemoryDir, { recursive: true });
 
   const hookLogicPath = nodePath.join(codingMemoryDir, "post-commit-hook.mjs");
-  nodeFs.writeFileSync(hookLogicPath, buildHookLogicScript(project, DIST_CLI_PATH), "utf-8");
+  nodeFs.writeFileSync(hookLogicPath, buildHookLogicScript(DIST_CLI_PATH), "utf-8");
 
   const hooksDir = nodePath.join(gitDir, "hooks");
   nodeFs.mkdirSync(hooksDir, { recursive: true });
@@ -729,6 +859,31 @@ async function cmdInit(project: string, targetPath: string) {
 
   registerMcpServer(DIST_INDEX_PATH);
   writeClaudeMd(project, resolvedPath);
+
+  const seededCount = await seedMemories(project, resolvedPath);
+  console.log(`Seeded ${seededCount} initial memories from project scan.`);
+
+  const backendOk = await verifyBackendConnection(project);
+
+  console.log("");
+  console.log("✓ Git hook installed");
+  console.log("✓ MCP server registered");
+  console.log("✓ CLAUDE.md written");
+  console.log(`✓ Seeded ${seededCount} memories from project scan`);
+  if (backendOk) {
+    console.log("✓ Backend connection verified");
+    console.log("");
+    console.log(
+      `stackmem is live. Open Claude Code and ask "what do you know about this project?" to verify.`
+    );
+  } else {
+    console.log("✗ Backend connection failed — run 'cm doctor' (once we build it)");
+  }
+
+  // Written last and deliberately: if a commit (and hence the post-commit
+  // hook) fires anywhere during init, it must still see whatever project
+  // .stackmem pointed to before this run, not the one being initialized now.
+  writeProjectFile(project, resolvedPath);
 }
 
 // --- cm context ------------------------------------------------------------
@@ -794,8 +949,9 @@ async function main() {
 
   switch (command) {
     case "start": {
-      const [project] = args;
-      if (!project) usage();
+      const split = splitOptionalProject(args, 0);
+      if (!split) usage();
+      const project = requireProject(split.project);
       await cmdStart(project);
       break;
     }
@@ -805,44 +961,66 @@ async function main() {
       const positional = force
         ? [...args.slice(0, forceIndex), ...args.slice(forceIndex + 1)]
         : args;
-      const [project, type, ...rest] = positional;
-      if (!project || !type || rest.length === 0) usage();
+
+      let explicitProject: string | null;
+      let type: string | undefined;
+      let rest: string[];
+      if (MEMORY_TYPES.includes(positional[0] as MemoryType)) {
+        explicitProject = null;
+        [type, ...rest] = positional;
+      } else {
+        explicitProject = positional[0] ?? null;
+        [, type, ...rest] = positional;
+      }
+
+      if (!type || rest.length === 0) usage();
+      const project = requireProject(explicitProject);
       await cmdSave(project, type, rest.join(" "), force);
       break;
     }
     case "fix": {
-      const [project, problem, solution] = args;
-      if (!project || !problem || !solution) usage();
+      const split = splitOptionalProject(args, 2);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [problem, solution] = split.rest;
       await cmdFix(project, problem, solution);
       break;
     }
     case "analyze": {
-      const [project, path] = args;
-      if (!project || !path) usage();
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [path] = split.rest;
       await cmdAnalyze(project, path);
       break;
     }
     case "search": {
-      const [project, ...rest] = args;
-      if (!project || rest.length === 0) usage();
-      await cmdSearch(project, rest.join(" "));
+      const split = splitProjectFromVariadic(args);
+      const project = requireProject(split.project);
+      if (split.rest.length === 0) usage();
+      await cmdSearch(project, split.rest.join(" "));
       break;
     }
     case "resolve": {
-      const [project, memoryId] = args;
-      if (!project || !memoryId) usage();
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [memoryId] = split.rest;
       await cmdResolve(project, memoryId);
       break;
     }
     case "delete": {
-      const [project, memoryId] = args;
-      if (!project || !memoryId) usage();
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [memoryId] = split.rest;
       await cmdDelete(project, memoryId);
       break;
     }
     case "compress": {
-      const [project] = args;
-      if (!project) usage();
+      const split = splitOptionalProject(args, 0);
+      if (!split) usage();
+      const project = requireProject(split.project);
       await cmdCompress(project);
       break;
     }
@@ -853,9 +1031,10 @@ async function main() {
       break;
     }
     case "context": {
-      const [project, ...rest] = args;
-      if (!project || rest.length === 0) usage();
-      await cmdContext(project, rest.join(" "));
+      const split = splitProjectFromVariadic(args);
+      const project = requireProject(split.project);
+      if (split.rest.length === 0) usage();
+      await cmdContext(project, split.rest.join(" "));
       break;
     }
     case "help": {

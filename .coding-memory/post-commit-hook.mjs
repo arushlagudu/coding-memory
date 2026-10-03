@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
-const PROJECT = "testproject";
+const stackmemPath = join(process.cwd(), ".stackmem");
+let PROJECT;
+try {
+  PROJECT = readFileSync(stackmemPath, "utf8").trim();
+} catch {
+  process.exit(0); // no .stackmem, skip silently
+}
+
 const CLI_PATH = "/Users/aruna/coding-memory/coding-memory/dist/cli.js";
 
 function git(args) {

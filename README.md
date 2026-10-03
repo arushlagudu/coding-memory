@@ -16,7 +16,13 @@ Then in any git repo:
 cm init <project> .
 ```
 
-That's it. No config, no accounts, no env file.
+`cm init <project> .` does three things automatically:
+
+1. Installs a git post-commit hook
+2. Registers the stackmem MCP server with Claude Code
+3. Writes a CLAUDE.md to the project
+
+After that, memories load automatically when you open Claude Code and save automatically on every commit. No further setup needed.
 
 ## Usage
 
