@@ -818,7 +818,7 @@ for (const line of isFirstCommit ? [] : lines) {
       savedItems.push(\`discovery: \${content}\`);
     }
 
-    if (/TODO:|FIXME:|HACK:|XXX:/.test(codeLine)) {
+    if (/^\\+\\s*(\\/\\/|#)\\s*(TODO:|FIXME:|HACK:|XXX:)/.test(line)) {
       const truncated = codeLine.trim().slice(0, 100);
       const content = \`open issue from commit: \${truncated}\`;
       cmSave("discovery", content);
