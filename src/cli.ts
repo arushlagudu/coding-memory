@@ -957,6 +957,16 @@ function writeProjectFile(project: string, resolvedPath: string): void {
 async function seedMemories(project: string, resolvedPath: string): Promise<number> {
   let seededCount = 0;
 
+  const { data: existingRows, error: existingError } = await supabase
+    .from("memories")
+    .select("id, content")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (existingError) fail(`Failed to load memories: ${existingError.message}`);
+
+  const existingMemories = existingRows ?? [];
+
   const packageJsonPath = nodePath.join(resolvedPath, "package.json");
   if (nodeFs.existsSync(packageJsonPath)) {
     try {
@@ -966,13 +976,17 @@ async function seedMemories(project: string, resolvedPath: string): Promise<numb
         ...Object.keys(pkg.devDependencies ?? {}),
       ];
       if (depNames.length > 0) {
-        const { error } = await supabase.from("memories").insert({
-          project,
-          type: "discovery",
-          content: `tech stack: ${depNames.join(", ")}`,
-          device_id: getDeviceId(),
-        });
-        if (!error) seededCount++;
+        const content = `tech stack: ${depNames.join(", ")}`;
+        const decision = decideSaveAction(content, existingMemories);
+        if (decision.action !== "duplicate") {
+          const { error } = await supabase.from("memories").insert({
+            project,
+            type: "discovery",
+            content,
+            device_id: getDeviceId(),
+          });
+          if (!error) seededCount++;
+        }
       }
     } catch {
       // Malformed package.json — skip the tech-stack memory.
@@ -988,13 +1002,17 @@ async function seedMemories(project: string, resolvedPath: string): Promise<numb
       .map((line) => line.split("=")[0]);
 
     if (varNames.length > 0) {
-      const { error } = await supabase.from("memories").insert({
-        project,
-        type: "constraint",
-        content: `required env vars: ${varNames.join(", ")}`,
-        device_id: getDeviceId(),
-      });
-      if (!error) seededCount++;
+      const content = `required env vars: ${varNames.join(", ")}`;
+      const decision = decideSaveAction(content, existingMemories);
+      if (decision.action !== "duplicate") {
+        const { error } = await supabase.from("memories").insert({
+          project,
+          type: "constraint",
+          content,
+          device_id: getDeviceId(),
+        });
+        if (!error) seededCount++;
+      }
     }
   }
 
