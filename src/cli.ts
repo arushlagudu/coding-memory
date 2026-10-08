@@ -70,6 +70,9 @@ function usage(): never {
 function cmdHelp() {
   console.log(`cm — coding memory CLI
 
+  Works with Claude Code, Cursor, and Windsurf — 'cm init' writes the
+  CLAUDE.md, .cursorrules, and .windsurfrules files each tool reads.
+
   [project] is optional everywhere below if a .stackmem file exists in
   the current directory (written by 'cm init'). Otherwise pass it explicitly.
 
@@ -110,8 +113,11 @@ function cmdHelp() {
 
   cm init <project> <path>
       Install a git post-commit hook in the repo at <path>, register
-      the stackmem MCP server with Claude Code, write a CLAUDE.md and
-      .stackmem file, and seed initial memories from the project scan.
+      the stackmem MCP server with Claude Code, write a CLAUDE.md,
+      .cursorrules, .windsurfrules, and .stackmem file, and seed
+      initial memories from the project scan. .cursorrules and
+      .windsurfrules (for Cursor and Windsurf) are skipped if they
+      already exist.
 
   cm context [--project <name>] <task>
       Return only the top 5 memories most relevant to a specific
@@ -895,6 +901,50 @@ cm save ${project} <type> "<content>"
   console.log("CLAUDE.md written.");
 }
 
+const EDITOR_RULES_CONTENT = `# stackmem
+
+At the start of every session, run:
+cm start
+
+and paste the output here before starting work.
+
+When you make a decision, discover a constraint,
+reject an approach, or make a discovery, save it:
+cm save <type> "<content>"
+
+Types: decision, rejection, constraint, discovery
+`;
+
+// Returns true if the file was written, false if it already existed
+// (and was skipped).
+function writeCursorRules(resolvedPath: string): boolean {
+  const cursorRulesPath = nodePath.join(resolvedPath, ".cursorrules");
+
+  if (nodeFs.existsSync(cursorRulesPath)) {
+    console.log(".cursorrules already exists — skipping.");
+    return false;
+  }
+
+  nodeFs.writeFileSync(cursorRulesPath, EDITOR_RULES_CONTENT, "utf-8");
+  console.log(".cursorrules written.");
+  return true;
+}
+
+// Returns true if the file was written, false if it already existed
+// (and was skipped).
+function writeWindsurfRules(resolvedPath: string): boolean {
+  const windsurfRulesPath = nodePath.join(resolvedPath, ".windsurfrules");
+
+  if (nodeFs.existsSync(windsurfRulesPath)) {
+    console.log(".windsurfrules already exists — skipping.");
+    return false;
+  }
+
+  nodeFs.writeFileSync(windsurfRulesPath, EDITOR_RULES_CONTENT, "utf-8");
+  console.log(".windsurfrules written.");
+  return true;
+}
+
 function writeProjectFile(project: string, resolvedPath: string): void {
   const stackmemPath = nodePath.join(resolvedPath, STACKMEM_FILE);
   nodeFs.writeFileSync(stackmemPath, `${project}\n`, "utf-8");
@@ -990,6 +1040,8 @@ async function cmdInit(project: string, targetPath: string) {
 
   registerMcpServer(DIST_INDEX_PATH);
   writeClaudeMd(project, resolvedPath);
+  const cursorRulesWritten = writeCursorRules(resolvedPath);
+  const windsurfRulesWritten = writeWindsurfRules(resolvedPath);
 
   const seededCount = await seedMemories(project, resolvedPath);
   console.log(`Seeded ${seededCount} initial memories from project scan.`);
@@ -1000,6 +1052,12 @@ async function cmdInit(project: string, targetPath: string) {
   console.log("✓ Git hook installed");
   console.log("✓ MCP server registered");
   console.log("✓ CLAUDE.md written");
+  console.log(
+    `✓ .cursorrules ${cursorRulesWritten ? "written" : "already exists"}`
+  );
+  console.log(
+    `✓ .windsurfrules ${windsurfRulesWritten ? "written" : "already exists"}`
+  );
   console.log(`✓ Seeded ${seededCount} memories from project scan`);
   if (backendOk) {
     console.log("✓ Backend connection verified");
