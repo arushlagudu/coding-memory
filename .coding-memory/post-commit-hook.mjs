@@ -243,3 +243,5 @@ console.log(`coding-memory post-commit summary (${changedFiles.length} file(s) c
 for (const item of savedItems) {
   console.log(`  - ${item}`);
 }
+
+execFileSync("node", [CLI_PATH, "sync"], { stdio: "inherit" });

@@ -1,0 +1,26 @@
+# stackmem — project memory (auto-updated)
+## Project: coding-memory
+
+### Decisions
+- built stripe webhook handler with error handling
+- feat: diff-first hierarchy, commit quality filter, first-commit fix
+- feat: dynamic project name from .stackmem, fix init ordering, seed memories on init
+- feat: write .cursorrules and .windsurfrules on cm init for Cursor and Windsurf support
+- chore: remove dist from git, fix TODO detection to comments only
+- fix: add --force to git hook saves to prevent interactive prompts during commits
+- feat: hosted Supabase backend, npm publish as stackmem, no env file required
+- chore: remove dist from git tracking, add to gitignore
+- chore: remove exported memories file, ignore memory exports
+- feat: cm doctor, cm undo, cm export, cm import — Phase 4 and 5 complete
+- feat: cm inspect command with full link network and related fixes
+
+### Discoveries
+- open issue from commit: // TODO: optimize the clustering algorithm
+- open issue from commit: if (/TODO:|FIXME:|HACK:|XXX:/.test(codeLine)) {
+
+### Recent Fixes
+- webhook returned 400 → null
+
+---
+*Last updated: 10/8/2026, 11:33:09 PM*
+*Run `cm start` for full details with decay scores*

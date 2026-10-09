@@ -54,6 +54,7 @@ function usage(): never {
   cm inspect [project] <memory-id>
   cm compress [project]
   cm init <project> <path>
+  cm sync
   cm context [--project <name>] <task>
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
   cm doctor
@@ -125,8 +126,16 @@ function cmdHelp() {
       the stackmem MCP server with Claude Code, write a CLAUDE.md,
       .cursorrules, .windsurfrules, and .stackmem file, and seed
       initial memories from the project scan. .cursorrules and
-      .windsurfrules (for Cursor and Windsurf) are skipped if they
-      already exist.
+      .windsurfrules are pre-filled with the project's current
+      memories (for Cursor and Windsurf) and skipped if they already
+      exist. The post-commit hook keeps them fresh afterward by
+      running 'cm sync' on every commit.
+
+  cm sync
+      Regenerate .cursorrules and .windsurfrules from the project's
+      current unresolved memories (decay-ranked, capped at a 2000
+      token budget) and its 5 most recent open execution_log fixes,
+      overwriting both files. Project is read from .stackmem.
 
   cm context [--project <name>] <task>
       Return only the top 5 memories most relevant to a specific
@@ -955,6 +964,8 @@ console.log(\`coding-memory post-commit summary (\${changedFiles.length} file(s)
 for (const item of savedItems) {
   console.log(\`  - \${item}\`);
 }
+
+execFileSync("node", [CLI_PATH, "sync"], { stdio: "inherit" });
 `;
 }
 
@@ -1011,23 +1022,88 @@ cm save ${project} <type> "<content>"
   console.log("CLAUDE.md written.");
 }
 
-const EDITOR_RULES_CONTENT = `# stackmem
+// Section order for the generated rules-file markdown — matches the order
+// memories are presented in everywhere else (cm context's CONTEXT_TYPE_ORDER),
+// not MEMORY_TYPES' declaration order.
+const RULES_FILE_TYPE_ORDER: MemoryType[] = ["decision", "constraint", "rejection", "discovery"];
 
-At the start of every session, run:
-cm start
+// Builds the markdown written into .cursorrules / .windsurfrules: the
+// project's unresolved memories (decay-ranked, budget-capped so an
+// editor's system prompt never balloons) plus its most recent open fixes.
+// Shared by `cm init` (first write) and `cm sync` (refresh on every commit).
+async function generateRulesContent(project: string): Promise<string> {
+  const { data: memoryRows, error: memoriesError } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false);
 
-and paste the output here before starting work.
+  if (memoriesError) fail(`Failed to load memories: ${memoriesError.message}`);
 
-When you make a decision, discover a constraint,
-reject an approach, or make a discovery, save it:
-cm save <type> "<content>"
+  const scoredMemories = (memoryRows ?? [])
+    .map((memory) => ({
+      ...memory,
+      decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0),
+    }))
+    .sort((a, b) => b.decay_score - a.decay_score);
 
-Types: decision, rejection, constraint, discovery
-`;
+  const budgetedMemories = applyContextBudget(scoredMemories, CONTEXT_BUDGET_TOKENS);
+
+  const { data: fixRows, error: fixesError } = await supabase
+    .from("execution_log")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (fixesError) fail(`Failed to load execution log: ${fixesError.message}`);
+
+  const fixes = fixRows ?? [];
+
+  const lines: string[] = [];
+  lines.push("# stackmem — project memory (auto-updated)");
+  lines.push(`## Project: ${project}`);
+
+  if (budgetedMemories.length === 0 && fixes.length === 0) {
+    lines.push("");
+    lines.push("No memories yet. Make a commit to start capturing.");
+  } else {
+    for (const type of RULES_FILE_TYPE_ORDER) {
+      const group = budgetedMemories.filter((memory) => memory.type === type);
+      if (group.length === 0) continue;
+
+      lines.push("");
+      lines.push(`### ${TYPE_LABELS[type]}`);
+      for (const memory of group) {
+        lines.push(`- ${memory.content}`);
+      }
+    }
+
+    if (fixes.length > 0) {
+      lines.push("");
+      lines.push("### Recent Fixes");
+      for (const fix of fixes) {
+        const solution = fix.solution && fix.solution.trim().length > 0
+          ? fix.solution
+          : "(solution pending)";
+        lines.push(`- ${fix.problem} → ${solution}`);
+      }
+    }
+  }
+
+  lines.push("");
+  lines.push("---");
+  lines.push(`*Last updated: ${new Date().toLocaleString("en-US")}*`);
+  lines.push("*Run `cm start` for full details with decay scores*");
+  lines.push("");
+
+  return lines.join("\n");
+}
 
 // Returns true if the file was written, false if it already existed
 // (and was skipped).
-function writeCursorRules(resolvedPath: string): boolean {
+function writeCursorRules(resolvedPath: string, content: string): boolean {
   const cursorRulesPath = nodePath.join(resolvedPath, ".cursorrules");
 
   if (nodeFs.existsSync(cursorRulesPath)) {
@@ -1035,14 +1111,14 @@ function writeCursorRules(resolvedPath: string): boolean {
     return false;
   }
 
-  nodeFs.writeFileSync(cursorRulesPath, EDITOR_RULES_CONTENT, "utf-8");
+  nodeFs.writeFileSync(cursorRulesPath, content, "utf-8");
   console.log(".cursorrules written.");
   return true;
 }
 
 // Returns true if the file was written, false if it already existed
 // (and was skipped).
-function writeWindsurfRules(resolvedPath: string): boolean {
+function writeWindsurfRules(resolvedPath: string, content: string): boolean {
   const windsurfRulesPath = nodePath.join(resolvedPath, ".windsurfrules");
 
   if (nodeFs.existsSync(windsurfRulesPath)) {
@@ -1050,7 +1126,7 @@ function writeWindsurfRules(resolvedPath: string): boolean {
     return false;
   }
 
-  nodeFs.writeFileSync(windsurfRulesPath, EDITOR_RULES_CONTENT, "utf-8");
+  nodeFs.writeFileSync(windsurfRulesPath, content, "utf-8");
   console.log(".windsurfrules written.");
   return true;
 }
@@ -1168,11 +1244,13 @@ async function cmdInit(project: string, targetPath: string) {
 
   registerMcpServer(DIST_INDEX_PATH);
   writeClaudeMd(project, resolvedPath);
-  const cursorRulesWritten = writeCursorRules(resolvedPath);
-  const windsurfRulesWritten = writeWindsurfRules(resolvedPath);
 
   const seededCount = await seedMemories(project, resolvedPath);
   console.log(`Seeded ${seededCount} initial memories from project scan.`);
+
+  const rulesContent = await generateRulesContent(project);
+  const cursorRulesWritten = writeCursorRules(resolvedPath, rulesContent);
+  const windsurfRulesWritten = writeWindsurfRules(resolvedPath, rulesContent);
 
   const backendOk = await verifyBackendConnection(project);
 
@@ -1201,6 +1279,18 @@ async function cmdInit(project: string, targetPath: string) {
   // hook) fires anywhere during init, it must still see whatever project
   // .stackmem pointed to before this run, not the one being initialized now.
   writeProjectFile(project, resolvedPath);
+}
+
+// --- cm sync ---------------------------------------------------------------
+
+async function cmdSync(project: string) {
+  const resolvedPath = process.cwd();
+  const rulesContent = await generateRulesContent(project);
+
+  nodeFs.writeFileSync(nodePath.join(resolvedPath, ".cursorrules"), rulesContent, "utf-8");
+  nodeFs.writeFileSync(nodePath.join(resolvedPath, ".windsurfrules"), rulesContent, "utf-8");
+
+  console.log("Synced memories to .cursorrules and .windsurfrules");
 }
 
 // --- cm context ------------------------------------------------------------
@@ -1729,6 +1819,12 @@ async function main() {
       const [project, targetPath] = args;
       if (!project || !targetPath) usage();
       await cmdInit(project, targetPath);
+      break;
+    }
+    case "sync": {
+      if (args.length > 0) usage();
+      const project = requireProject(null);
+      await cmdSync(project);
       break;
     }
     case "context": {
