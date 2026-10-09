@@ -802,6 +802,15 @@ const savedItems = [];
 
 const commitMessage = git(["log", "-1", "--pretty=%B"]);
 
+// The sync commit below is itself a commit, so it fires this same
+// post-commit hook again — git's --no-verify only skips pre-commit and
+// commit-msg hooks, never post-commit. Without this guard, the hook would
+// save its own commit message as a new decision memory, which changes the
+// rules-file content and triggers another sync commit, indefinitely.
+if (commitMessage.includes("[skip ci]")) {
+  process.exit(0);
+}
+
 const isFirstCommit = (() => {
   try {
     execFileSync("git", ["rev-parse", "HEAD~1"], { stdio: "pipe" });
@@ -966,6 +975,20 @@ for (const item of savedItems) {
 }
 
 execFileSync("node", [CLI_PATH, "sync"], { stdio: "inherit" });
+
+// cm sync rewrites .cursorrules/.windsurfrules, which would otherwise leave
+// the working directory dirty (breaking things like \`npm version patch\`
+// that require a clean tree). Commit the sync ourselves instead. --no-verify
+// skips pre-commit/commit-msg hooks (not post-commit — see the [skip ci]
+// guard above, which is what actually stops this from recursing).
+try {
+  execFileSync("git", ["add", ".cursorrules", ".windsurfrules"], { stdio: "pipe" });
+  execFileSync("git", ["commit", "--no-verify", "-m", "chore: sync memory to rules files [skip ci]"], {
+    stdio: "pipe",
+  });
+} catch {
+  // Nothing to commit (rules files unchanged) — fine, ignore.
+}
 `;
 }
 

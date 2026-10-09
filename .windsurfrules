@@ -12,6 +12,7 @@
 - chore: remove dist from git tracking, add to gitignore
 - chore: remove exported memories file, ignore memory exports
 - feat: cm doctor, cm undo, cm export, cm import — Phase 4 and 5 complete
+- feat: cm sync — auto-embed memories into .cursorrules and .windsurfrules
 - feat: cm inspect command with full link network and related fixes
 
 ### Discoveries
@@ -19,8 +20,8 @@
 - open issue from commit: if (/TODO:|FIXME:|HACK:|XXX:/.test(codeLine)) {
 
 ### Recent Fixes
-- webhook returned 400 → null
+- webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/8/2026, 11:33:09 PM*
+*Last updated: 10/8/2026, 11:35:37 PM*
 *Run `cm start` for full details with decay scores*
