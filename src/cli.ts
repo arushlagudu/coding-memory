@@ -14,6 +14,7 @@ import {
   computeMemoryLinks,
   decideSaveAction,
   estimateTokens,
+  extractEntities,
   indicatesFailedApproach,
   isAuthRelatedFile,
   isCodeFile,
@@ -50,6 +51,7 @@ function usage(): never {
   cm search [--project <name>] <query>
   cm resolve [project] <memory-id>
   cm delete [project] <memory-id>
+  cm inspect [project] <memory-id>
   cm compress [project]
   cm init <project> <path>
   cm context [--project <name>] <task>
@@ -106,6 +108,13 @@ function cmdHelp() {
 
   cm delete [project] <memory-id>
       Delete a memory and any memory_links referencing it.
+
+  cm inspect [project] <memory-id>
+      Show a rich view of a single memory: type, content, created
+      date, access count, decay score, and resolved status, plus
+      every linked memory (in either link direction) with its link
+      score, and any execution_log fixes whose problem or solution
+      shares a key entity with the memory's content.
 
   cm compress [project]
       Cluster related unresolved memories (needs 20+) and collapse
@@ -591,6 +600,107 @@ async function cmdDelete(project: string, memoryId: string) {
   if (error) fail(`Failed to delete memory: ${error.message}`);
 
   console.log(`Deleted memory [${memoryId}]`);
+}
+
+// --- cm inspect ------------------------------------------------------------
+
+function formatDate(dateString: string): string {
+  return new Date(dateString).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+}
+
+async function cmdInspect(project: string, memoryId: string) {
+  const { data: memory, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("id", memoryId)
+    .single();
+
+  if (error || !memory) fail(`Memory [${memoryId}] not found for "${project}".`);
+
+  const decayScore = computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0);
+
+  const { data: links, error: linksError } = await supabase
+    .from("memory_links")
+    .select("source_id, target_id, score")
+    .or(`source_id.eq.${memoryId},target_id.eq.${memoryId}`);
+
+  if (linksError) fail(`Failed to load memory links: ${linksError.message}`);
+
+  const linkedEntries = (links ?? []).map((link) => ({
+    linkedId: link.source_id === memoryId ? link.target_id : link.source_id,
+    score: link.score,
+  }));
+
+  let linkedMemories: Array<{
+    id: string;
+    type: string;
+    content: string;
+    created_at: string;
+    score: number;
+  }> = [];
+
+  if (linkedEntries.length > 0) {
+    const linkedIds = linkedEntries.map((entry) => entry.linkedId);
+    const { data: linkedRows, error: linkedError } = await supabase
+      .from("memories")
+      .select("id, type, content, created_at")
+      .in("id", linkedIds);
+
+    if (linkedError) fail(`Failed to load linked memories: ${linkedError.message}`);
+
+    const scoreById = new Map(linkedEntries.map((entry) => [entry.linkedId, entry.score]));
+    linkedMemories = (linkedRows ?? [])
+      .map((row) => ({ ...row, score: scoreById.get(row.id) ?? 0 }))
+      .sort((a, b) => b.score - a.score);
+  }
+
+  const entities = extractEntities(memory.content);
+  const { data: fixes, error: fixesError } = await supabase
+    .from("execution_log")
+    .select("problem, solution")
+    .eq("project", project);
+
+  if (fixesError) fail(`Failed to load execution log: ${fixesError.message}`);
+
+  const relatedFixes = (fixes ?? []).filter((fix) => {
+    const fixEntities = extractEntities(`${fix.problem} ${fix.solution}`);
+    for (const entity of entities) {
+      if (fixEntities.has(entity)) return true;
+    }
+    return false;
+  });
+
+  const divider = "─".repeat(40);
+  console.log(divider);
+  console.log(
+    `${memory.type.toUpperCase()} · accessed ${memory.access_count ?? 0}x · decay ${decayScore.toFixed(2)}`
+  );
+  console.log(divider);
+  console.log(memory.content);
+  console.log("");
+  console.log(`Created: ${formatDate(memory.created_at)}`);
+  console.log(`Status:  ${memory.resolved ? "resolved" : "unresolved"}`);
+  console.log("");
+
+  console.log(`LINKED MEMORIES (${linkedMemories.length})`);
+  for (const linked of linkedMemories) {
+    console.log(`  └─ [score: ${linked.score.toFixed(2)}] ${linked.type.toUpperCase()}`);
+    console.log(`     ${linked.content}`);
+    console.log(`     ${formatDate(linked.created_at)}`);
+    console.log("");
+  }
+
+  if (relatedFixes.length > 0) {
+    console.log(`RELATED FIXES (${relatedFixes.length})`);
+    for (const fix of relatedFixes) {
+      console.log(`  └─ FIX: ${fix.problem} → ${fix.solution}`);
+    }
+  }
 }
 
 // --- cm init -------------------------------------------------------------
@@ -1598,6 +1708,14 @@ async function main() {
       const project = requireProject(split.project);
       const [memoryId] = split.rest;
       await cmdDelete(project, memoryId);
+      break;
+    }
+    case "inspect": {
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [memoryId] = split.rest;
+      await cmdInspect(project, memoryId);
       break;
     }
     case "compress": {
