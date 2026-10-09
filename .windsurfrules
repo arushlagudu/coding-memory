@@ -12,6 +12,7 @@
 - chore: remove dist from git tracking, add to gitignore
 - chore: remove exported memories file, ignore memory exports
 - feat: cm doctor, cm undo, cm export, cm import — Phase 4 and 5 complete
+- chore: remove stale .env pointing to dead Supabase project
 - feat: cm sync — auto-embed memories into .cursorrules and .windsurfrules
 - feat: cm inspect command with full link network and related fixes
 
@@ -23,5 +24,5 @@
 - webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/8/2026, 11:51:48 PM*
+*Last updated: 10/8/2026, 11:56:20 PM*
 *Run `cm start` for full details with decay scores*
