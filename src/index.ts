@@ -129,8 +129,13 @@ server.registerTool(
         ? `Loaded ${memories.length} memory row(s) for "${project}" (${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used, ${omittedCount} omitted for budget).`
         : `Loaded ${memories.length} memory row(s) for "${project}" (${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used).`;
 
+    const hasTechStackMemory = memories.some((m) => /^tech stack:/i.test(m.content));
+    const techStackTip = hasTechStackMemory
+      ? ""
+      : "\n\nTip: run 'cm init' to seed tech stack memories from your project files.";
+
     return {
-      content: [{ type: "text", text: budgetText }],
+      content: [{ type: "text", text: budgetText + techStackTip }],
       structuredContent: {
         memories: memoriesWithLinks,
         fixes,

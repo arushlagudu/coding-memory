@@ -270,6 +270,8 @@ async function cmdStart(project: string) {
   const memories = data ?? [];
   if (memories.length === 0) {
     console.log(`No memories found for "${project}".`);
+    console.log("");
+    console.log("Tip: run 'cm init' to seed tech stack memories from your project files.");
     return;
   }
 
@@ -356,6 +358,12 @@ async function cmdStart(project: string) {
   console.log(`Context budget: ${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used`);
   if (omittedCount > 0) {
     console.log(`${omittedCount} memories omitted (budget exceeded)`);
+  }
+
+  const hasTechStackMemory = memories.some((m) => /^tech stack:/i.test(m.content));
+  if (!hasTechStackMemory) {
+    console.log("");
+    console.log("Tip: run 'cm init' to seed tech stack memories from your project files.");
   }
 
   const incrementResults = await Promise.all(
@@ -1189,6 +1197,27 @@ function writeProjectFile(project: string, resolvedPath: string): void {
   nodeFs.writeFileSync(stackmemPath, `${project}\n`, "utf-8");
 }
 
+// Shared by every seedMemories check below: skip the insert if this exact
+// content already exists (decideSaveAction's duplicate check) so re-running
+// `cm init` on an already-seeded project doesn't pile up repeats.
+async function trySeedMemory(
+  project: string,
+  existingMemories: { id: string; content: string }[],
+  type: MemoryType,
+  content: string
+): Promise<boolean> {
+  const decision = decideSaveAction(content, existingMemories);
+  if (decision.action === "duplicate") return false;
+
+  const { error } = await supabase.from("memories").insert({
+    project,
+    type,
+    content,
+    device_id: getDeviceId(),
+  });
+  return !error;
+}
+
 // Scans the freshly-initialized project for a few cheap, high-signal facts
 // and saves them as memories directly (bypassing cmdSave's duplicate/conflict
 // prompt — there's nothing to conflict with yet, and init must stay
@@ -1216,16 +1245,7 @@ async function seedMemories(project: string, resolvedPath: string): Promise<numb
       ];
       if (depNames.length > 0) {
         const content = `tech stack: ${depNames.join(", ")}`;
-        const decision = decideSaveAction(content, existingMemories);
-        if (decision.action !== "duplicate") {
-          const { error } = await supabase.from("memories").insert({
-            project,
-            type: "discovery",
-            content,
-            device_id: getDeviceId(),
-          });
-          if (!error) seededCount++;
-        }
+        if (await trySeedMemory(project, existingMemories, "discovery", content)) seededCount++;
       }
     } catch {
       // Malformed package.json — skip the tech-stack memory.
@@ -1242,17 +1262,54 @@ async function seedMemories(project: string, resolvedPath: string): Promise<numb
 
     if (varNames.length > 0) {
       const content = `required env vars: ${varNames.join(", ")}`;
-      const decision = decideSaveAction(content, existingMemories);
-      if (decision.action !== "duplicate") {
-        const { error } = await supabase.from("memories").insert({
-          project,
-          type: "constraint",
-          content,
-          device_id: getDeviceId(),
-        });
-        if (!error) seededCount++;
-      }
+      if (await trySeedMemory(project, existingMemories, "constraint", content)) seededCount++;
     }
+  }
+
+  const tsconfigPath = nodePath.join(resolvedPath, "tsconfig.json");
+  if (nodeFs.existsSync(tsconfigPath)) {
+    try {
+      const tsconfig = JSON.parse(nodeFs.readFileSync(tsconfigPath, "utf-8"));
+      const target = tsconfig.compilerOptions?.target;
+      const moduleKind = tsconfig.compilerOptions?.module;
+      if (target || moduleKind) {
+        const content = `TypeScript config: target=${target ?? "unspecified"}, module=${moduleKind ?? "unspecified"}`;
+        if (await trySeedMemory(project, existingMemories, "constraint", content)) seededCount++;
+      }
+    } catch {
+      // Malformed tsconfig.json (or JSONC with comments) — skip.
+    }
+  }
+
+  const readmePath = nodePath.join(resolvedPath, "README.md");
+  if (nodeFs.existsSync(readmePath)) {
+    const words = nodeFs
+      .readFileSync(readmePath, "utf-8")
+      .split(/\s+/)
+      .filter(Boolean)
+      .slice(0, 100);
+    if (words.length > 0) {
+      const content = `project description: ${words.join(" ")}`;
+      if (await trySeedMemory(project, existingMemories, "discovery", content)) seededCount++;
+    }
+  }
+
+  const FRAMEWORK_FILE_INDICATORS: { file: string; type: MemoryType; content: string }[] = [
+    { file: "next.config.ts", type: "constraint", content: "framework: Next.js" },
+    { file: "next.config.js", type: "constraint", content: "framework: Next.js" },
+    { file: "vite.config.ts", type: "constraint", content: "framework: Vite" },
+    { file: "vite.config.js", type: "constraint", content: "framework: Vite" },
+    { file: "Dockerfile", type: "constraint", content: "containerized: Docker" },
+  ];
+  for (const indicator of FRAMEWORK_FILE_INDICATORS) {
+    if (!nodeFs.existsSync(nodePath.join(resolvedPath, indicator.file))) continue;
+    if (await trySeedMemory(project, existingMemories, indicator.type, indicator.content)) seededCount++;
+  }
+
+  const githubWorkflowsPath = nodePath.join(resolvedPath, ".github", "workflows");
+  if (nodeFs.existsSync(githubWorkflowsPath)) {
+    const content = "CI/CD: GitHub Actions";
+    if (await trySeedMemory(project, existingMemories, "discovery", content)) seededCount++;
   }
 
   analyzeCodebase(resolvedPath);

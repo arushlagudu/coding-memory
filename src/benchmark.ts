@@ -11,10 +11,10 @@ import { fileURLToPath } from "node:url";
 import {
   applyContextBudget,
   computeDecayScore,
-  containmentScore,
   decideSaveAction,
   estimateTokens,
   extractEntities,
+  hybridScore,
   scoreMemoryRelevance,
   type ExistingMemory,
 } from "./scoring.js";
@@ -407,7 +407,18 @@ function benchmarkContradictionDetection(
   allMemories: MemoryRow[],
   unrelatedPairs: [MemoryRow, MemoryRow][]
 ): ContradictionDetectionResult {
-  const baseSample = seededShuffle(allMemories, BENCHMARK_SEED + 2).slice(0, SAMPLE_SIZE / 2);
+  // Hook-generated templates (dependency changes, config/schema/TODO
+  // discoveries) are structural event records, not decisions — decideSaveAction
+  // deliberately exempts dependency templates from ever routing to
+  // "superseded" (see DEPENDENCY_TEMPLATE_RE in scoring.ts), and prepending
+  // "switched from X" to any of these templates isn't a phrase anyone would
+  // actually write. Sampling them here would just measure whether that
+  // exemption holds, not whether contradiction detection works — so they're
+  // excluded, keeping this test on genuine decision/discovery-style content.
+  const contradictableMemories = allMemories.filter(
+    (m) => !HOOK_TEMPLATE_PREFIXES.some((p) => m.content.startsWith(p.prefix))
+  );
+  const baseSample = seededShuffle(contradictableMemories, BENCHMARK_SEED + 2).slice(0, SAMPLE_SIZE / 2);
 
   let tp = 0;
   let fn = 0;
@@ -457,6 +468,14 @@ interface SemanticLinkingResult {
 // exhaustively rather than randomly sampled — at this data size (a few
 // thousand possible pairs at most) exhaustive is cheap and gives a more
 // stable number than a small random draw would.
+//
+// CAVEAT: avgLinkScore below reads memory_links.score as stored — i.e.
+// whatever computeMemoryLinks computed at save time. Rows saved before
+// computeMemoryLinks switched from containmentScore to hybridScore still
+// hold old-formula scores; only the baseline here is guaranteed to reflect
+// the current formula (it's computed live). A mixed-vintage avgLinkScore
+// vs. a current-formula baseline is still the most honest comparison
+// available without backfilling every historical link.
 function benchmarkSemanticLinking(allMemories: MemoryRow[], allLinks: MemoryLinkRow[]): SemanticLinkingResult {
   const avgLinkScore =
     allLinks.length === 0 ? 0 : allLinks.reduce((sum, l) => sum + l.score, 0) / allLinks.length;
@@ -472,12 +491,11 @@ function benchmarkSemanticLinking(allMemories: MemoryRow[], allLinks: MemoryLink
   let baselineSum = 0;
   let baselineCount = 0;
   for (const rows of byProject.values()) {
-    const entitiesById = new Map(rows.map((m) => [m.id, extractEntities(m.content)]));
     for (let i = 0; i < rows.length; i++) {
       for (let j = i + 1; j < rows.length; j++) {
         const key = pairKey(rows[i].id, rows[j].id);
         if (linkedPairKeys.has(key)) continue;
-        baselineSum += containmentScore(entitiesById.get(rows[i].id)!, entitiesById.get(rows[j].id)!);
+        baselineSum += hybridScore(rows[i].content, rows[j].content);
         baselineCount++;
       }
     }

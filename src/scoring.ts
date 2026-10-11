@@ -5,11 +5,34 @@ const STOP_WORDS = new Set([
   "of", "in", "it", "this", "that", "with", "and", "or", "but",
 ]);
 
+// Bumping this from 5 to 6 was considered (see the benchmark's duplicate-
+// detection findings) but doesn't actually fix anything: "removed" is 7
+// chars and "added"/"dependency" aren't the problem either. The real issue
+// is entity-level, not length-based — see DEPENDENCY_TEMPLATE_RE below.
 const MIN_ENTITY_LENGTH = 5;
+
+// Hook-generated dependency-change templates ("removed dependency: X" /
+// "added dependency: X") reduce to just {"removed"/"added", "dependency"}
+// under generic word-based extraction below, since package names are often
+// short (node:path, zod, ./device.js — all filtered by MIN_ENTITY_LENGTH).
+// That made two DIFFERENT packages removed in different commits look like
+// duplicates of each other. Special-cased here instead: for these
+// templates, the package name itself is the only entity, so containment
+// (and hybridScore) only agrees when the package name actually matches.
+const DEPENDENCY_TEMPLATE_RE = /^(removed|added) dependency:/i;
+const DEPENDENCY_PACKAGE_RE = /^(?:removed|added) dependency:\s*(.+)$/i;
+
+function extractDependencyPackageName(content: string): string | null {
+  const match = DEPENDENCY_PACKAGE_RE.exec(content.trim());
+  return match ? match[1].trim().toLowerCase() : null;
+}
 
 // Key entities: words longer than 4 characters that aren't stop words.
 // Short/common words carry little identifying signal for a memory.
 export function extractEntities(text: string): Set<string> {
+  const packageName = extractDependencyPackageName(text);
+  if (packageName !== null) return new Set([packageName]);
+
   const entities = new Set<string>();
   for (const word of text.toLowerCase().split(/\W+/)) {
     if (word.length < MIN_ENTITY_LENGTH || STOP_WORDS.has(word)) continue;
@@ -33,6 +56,55 @@ export function containmentScore(entitiesA: Set<string>, entitiesB: Set<string>)
   return shared / smallerSize;
 }
 
+function trigramSet(text: string): Set<string> {
+  const normalized = text.toLowerCase();
+  if (normalized.length < 3) {
+    return normalized.length > 0 ? new Set([normalized]) : new Set();
+  }
+
+  const trigrams = new Set<string>();
+  for (let i = 0; i <= normalized.length - 3; i++) {
+    trigrams.add(normalized.slice(i, i + 3));
+  }
+  return trigrams;
+}
+
+// Character-trigram Jaccard overlap: catches surface-level lexical
+// similarity (typos, partial substrings, shared phrasing) that word-based
+// containment misses entirely, since containment only ever compares whole
+// extracted entities.
+function ngramOverlap(a: string, b: string): number {
+  const trigramsA = trigramSet(a);
+  const trigramsB = trigramSet(b);
+  const union = new Set([...trigramsA, ...trigramsB]);
+  if (union.size === 0) return 0;
+
+  let shared = 0;
+  for (const trigram of trigramsA) {
+    if (trigramsB.has(trigram)) shared++;
+  }
+  return shared / union.size;
+}
+
+// Blends entity containment (structural: do the two texts share key
+// extracted terms) with character-trigram overlap (lexical: do the two
+// texts look alike as raw strings) so near-duplicates with slightly
+// different wording still score high even when their extracted entities
+// don't line up neatly, and vice versa.
+//
+// NOTE ON THRESHOLDS: DUPLICATE_THRESHOLD (0.85), CONTRADICTION_MIN (0.4),
+// computeMemoryLinks' default (0.15), and CLUSTER_THRESHOLD (0.2) were all
+// tuned against pure containmentScore. The 0.3 trigram component shifts
+// scores upward for almost any pair sharing common substrings (whitespace,
+// "ing", "the", etc.), so these thresholds may need recalibration —
+// re-validate against src/benchmark.ts rather than assuming they still
+// hold as-is.
+export function hybridScore(a: string, b: string): number {
+  const containment = containmentScore(extractEntities(a), extractEntities(b));
+  const overlap = ngramOverlap(a, b);
+  return containment * 0.7 + overlap * 0.3;
+}
+
 // --- memory links ------------------------------------------------------
 
 export interface ExistingMemory {
@@ -52,12 +124,11 @@ export function computeMemoryLinks(
   existingMemories: ExistingMemory[],
   threshold = 0.15
 ): MemoryLink[] {
-  const newEntities = extractEntities(newContent);
   return existingMemories
     .map((existing) => ({
       source_id: newMemoryId,
       target_id: existing.id,
-      score: containmentScore(newEntities, extractEntities(existing.content)),
+      score: hybridScore(newContent, existing.content),
     }))
     .filter((link) => link.score > threshold);
 }
@@ -79,12 +150,6 @@ function containsNegationWord(text: string): boolean {
   return NEGATION_WORDS.some((word) => lower.includes(word));
 }
 
-// Hook-generated dependency-change templates (e.g. "removed dependency: X")
-// are structural facts, not decisions — "removed" trips the negation-word
-// check below, but there's nothing for them to supersede/contradict, so
-// they're exempted up front rather than ever entering the negation branch.
-const DEPENDENCY_TEMPLATE_RE = /^(removed|added) dependency:/i;
-
 export type SaveAction =
   | { action: "duplicate"; matchedId: string }
   | { action: "superseded"; oldId: string }
@@ -102,14 +167,17 @@ export function decideSaveAction(
   newContent: string,
   existingMemories: ExistingMemory[]
 ): SaveAction {
-  const newEntities = extractEntities(newContent);
+  // Dependency-change templates are structural facts, not decisions —
+  // "removed"/"added" would otherwise trip containsNegationWord below, but
+  // there's nothing for them to supersede/contradict, so they're exempted
+  // up front and only ever fall through to the plain duplicate check.
   const hasNegation = DEPENDENCY_TEMPLATE_RE.test(newContent) ? false : containsNegationWord(newContent);
 
   let bestDuplicate: { id: string; score: number } | null = null;
   let bestSupersede: { id: string; score: number } | null = null;
 
   for (const existing of existingMemories) {
-    const score = containmentScore(newEntities, extractEntities(existing.content));
+    const score = hybridScore(newContent, existing.content);
 
     if (score > DUPLICATE_THRESHOLD) {
       if (hasNegation) {
@@ -192,11 +260,9 @@ export function clusterMemories(memories: any[]): any[][] {
     if (rootA !== rootB) parent[rootA] = rootB;
   }
 
-  const entities = memories.map((memory) => extractEntities(memory.content));
-
   for (let i = 0; i < memories.length; i++) {
     for (let j = i + 1; j < memories.length; j++) {
-      if (containmentScore(entities[i], entities[j]) > CLUSTER_THRESHOLD) {
+      if (hybridScore(memories[i].content, memories[j].content) > CLUSTER_THRESHOLD) {
         union(i, j);
       }
     }
@@ -313,11 +379,12 @@ function splitWords(text: string): string[] {
     .filter((word) => word.length > 0 && !STOP_WORDS.has(word));
 }
 
-// Blends entity containment (structural overlap) with raw word overlap
-// (surface-level phrasing match) so a memory that shares the task's exact
-// wording scores well even if its extracted entities don't line up neatly.
+// Blends hybrid structural/lexical overlap (see hybridScore) with raw word
+// overlap (surface-level phrasing match) so a memory that shares the task's
+// exact wording scores well even if its extracted entities don't line up
+// neatly.
 export function scoreMemoryRelevance(memoryContent: string, task: string): number {
-  const containment = containmentScore(extractEntities(memoryContent), extractEntities(task));
+  const structuralScore = hybridScore(memoryContent, task);
 
   const memoryWords = new Set(splitWords(memoryContent));
   const taskWords = splitWords(task);
@@ -328,6 +395,6 @@ export function scoreMemoryRelevance(memoryContent: string, task: string): numbe
   }
   const wordOverlapRatio = taskWords.length === 0 ? 0 : shared / taskWords.length;
 
-  return containment * 0.7 + wordOverlapRatio * 0.3;
+  return structuralScore * 0.7 + wordOverlapRatio * 0.3;
 }
 // TODO: optimize the clustering algorithm
