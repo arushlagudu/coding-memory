@@ -13,6 +13,7 @@
 - feat: cm doctor, cm undo, cm export, cm import — Phase 4 and 5 complete
 - fix: add --force to git hook saves to prevent interactive prompts during commits
 - feat: hosted Supabase backend, npm publish as stackmem, no env file required
+- feat: hybrid scoring, richer seeding, entity extraction fixes, improved benchmarks
 
 ### Discoveries
 - open issue from commit: // TODO: optimize the clustering algorithm
@@ -22,5 +23,5 @@
 - webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/11/2026, 3:31:17 AM*
+*Last updated: 10/11/2026, 4:03:36 AM*
 *Run `cm start` for full details with decay scores*
