@@ -1,6 +1,8 @@
 # stackmem: MCP, Tree-Sitter AST Graphs, Hybrid Containment-Trigram Scoring, and Temporal Decay for Persistent AI Coding Agent Memory
 
-**The stackmem Project**
+**Arush Rao Lagudu**  
+October 2026
+
 `github.com/arushlagudu/coding-memory` · `github.com/arushlagudu/stackmem-vault`
 
 ---
@@ -60,26 +62,26 @@ stackmem's `decideSaveAction` function (Section 3.2.3) is structured around exac
 stackmem is organized as four layers, each consuming the output of the one below it:
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Layer 4: Context Delivery (MCP + CLI + Vault)   │
-│    session_start · cm start · stackmem-vault     │
-└───────────────────────┬───────────────────────────┘
-                         ↑
-┌─────────────────────────────────────────────────┐
-│  Layer 3: Temporal Ranking (Decay + Budget)      │
-│    exponential decay · 2000-token greedy fill    │
-└───────────────────────┬───────────────────────────┘
-                         ↑
-┌─────────────────────────────────────────────────┐
-│  Layer 2: Semantic Organization                 │
-│    typed ontology · hybrid scoring · atomic CRUD │
-│    · bidirectional linking                       │
-└───────────────────────┬───────────────────────────┘
-                         ↑
-┌─────────────────────────────────────────────────┐
-│  Layer 1: Capture (Git Hook + AST Indexer)       │
-│    post-commit hook · Tree-Sitter indexer        │
-└─────────────────────────────────────────────────┘
+===================================================
+Layer 4: Context Delivery (MCP + CLI + Vault)
+  session_start  |  cm start  |  stackmem-vault
+===================================================
+                        ^
+===================================================
+Layer 3: Temporal Ranking (Decay + Budget)
+  exponential decay  |  2000-token greedy fill
+===================================================
+                        ^
+===================================================
+Layer 2: Semantic Organization
+  typed ontology  |  hybrid scoring  |  atomic CRUD
+  bidirectional linking
+===================================================
+                        ^
+===================================================
+Layer 1: Capture (Git Hook + AST Indexer)
+  post-commit hook  |  Tree-Sitter indexer
+===================================================
 ```
 
 Information flows strictly upward: Layer 1 writes raw typed memories; Layer 2 deduplicates, links, and classifies them; Layer 3 ranks and budgets them for a given context window; Layer 4 renders the result into whatever surface the developer or agent is using. No layer reaches back down — a design choice that keeps each layer independently testable, and is precisely why Section 4 can benchmark deduplication accuracy, linking quality, and token efficiency as separate, non-interacting experiments.
