@@ -79,6 +79,12 @@ function containsNegationWord(text: string): boolean {
   return NEGATION_WORDS.some((word) => lower.includes(word));
 }
 
+// Hook-generated dependency-change templates (e.g. "removed dependency: X")
+// are structural facts, not decisions — "removed" trips the negation-word
+// check below, but there's nothing for them to supersede/contradict, so
+// they're exempted up front rather than ever entering the negation branch.
+const DEPENDENCY_TEMPLATE_RE = /^(removed|added) dependency:/i;
+
 export type SaveAction =
   | { action: "duplicate"; matchedId: string }
   | { action: "superseded"; oldId: string }
@@ -97,7 +103,7 @@ export function decideSaveAction(
   existingMemories: ExistingMemory[]
 ): SaveAction {
   const newEntities = extractEntities(newContent);
-  const hasNegation = containsNegationWord(newContent);
+  const hasNegation = DEPENDENCY_TEMPLATE_RE.test(newContent) ? false : containsNegationWord(newContent);
 
   let bestDuplicate: { id: string; score: number } | null = null;
   let bestSupersede: { id: string; score: number } | null = null;

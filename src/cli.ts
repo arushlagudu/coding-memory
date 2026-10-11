@@ -282,10 +282,30 @@ async function cmdStart(project: string) {
 
   const budgetedMemories = applyContextBudget(scoredMemories, CONTEXT_BUDGET_TOKENS);
   const omittedCount = scoredMemories.length - budgetedMemories.length;
-  const tokensUsed = budgetedMemories.reduce(
+  let tokensUsed = budgetedMemories.reduce(
     (sum, memory) => sum + estimateTokens(memory.content),
     0
   );
+
+  const { data: fixData, error: fixError } = await supabase
+    .from("execution_log")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false)
+    .order("created_at", { ascending: false })
+    .limit(5);
+
+  if (fixError) fail(`Failed to load execution log: ${fixError.message}`);
+
+  // Fixes share the same 2000-token budget as memories, which already
+  // consumed their portion above — fixes only get whatever room is left.
+  const budgetedFixes: { problem: string; solution: string | null }[] = [];
+  for (const fix of fixData ?? []) {
+    const tokens = estimateTokens(`${fix.problem} ${fix.solution ?? ""}`);
+    if (tokensUsed + tokens > CONTEXT_BUDGET_TOKENS) break;
+    budgetedFixes.push(fix);
+    tokensUsed += tokens;
+  }
 
   const memoryIds = budgetedMemories.map((m) => m.id);
   const linkedIdsByMemory = new Map<string, Set<string>>();
@@ -321,6 +341,16 @@ async function cmdStart(project: string) {
       }
     }
     console.log("");
+  }
+
+  if (budgetedFixes.length > 0) {
+    console.log(`Past Fixes (${budgetedFixes.length})`);
+    console.log("-".repeat(14));
+    for (const fix of budgetedFixes) {
+      console.log(`  Problem: ${fix.problem}`);
+      console.log(`  Solution: ${fix.solution ?? "(pending)"}`);
+      console.log("");
+    }
   }
 
   console.log(`Context budget: ${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used`);

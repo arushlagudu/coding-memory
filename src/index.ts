@@ -92,6 +92,23 @@ server.registerTool(
       linked_memory_ids: Array.from(linkedIdsByMemory.get(m.id) ?? []),
     }));
 
+    const { data: fixData, error: fixError } = await supabase
+      .from("execution_log")
+      .select("*")
+      .eq("project", project)
+      .eq("resolved", false)
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    if (fixError) {
+      throw new Error(`Failed to load execution log: ${fixError.message}`);
+    }
+
+    const fixes = (fixData ?? []).map((fix) => ({
+      problem: fix.problem,
+      solution: fix.solution ?? "pending",
+    }));
+
     if (budgetedMemories.length > 0) {
       const incrementResults = await Promise.all(
         budgetedMemories.map((memory) =>
@@ -116,6 +133,7 @@ server.registerTool(
       content: [{ type: "text", text: budgetText }],
       structuredContent: {
         memories: memoriesWithLinks,
+        fixes,
         context_budget: {
           budget_tokens: CONTEXT_BUDGET_TOKENS,
           tokens_used: tokensUsed,
