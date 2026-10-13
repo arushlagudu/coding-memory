@@ -1059,6 +1059,28 @@ function registerMcpServer(distIndexPath: string): void {
   console.log("stackmem MCP server registered with Claude Code.");
 }
 
+const DEFAULT_GITIGNORE_CONTENT = `node_modules/
+dist/
+.env
+.env.local
+.DS_Store
+*.log
+coverage/
+`;
+
+// Returns true if the file was created, false if it already existed
+// (and was left untouched).
+function writeGitignore(resolvedPath: string): boolean {
+  const gitignorePath = nodePath.join(resolvedPath, ".gitignore");
+
+  if (nodeFs.existsSync(gitignorePath)) {
+    return false;
+  }
+
+  nodeFs.writeFileSync(gitignorePath, DEFAULT_GITIGNORE_CONTENT, "utf-8");
+  return true;
+}
+
 function writeClaudeMd(project: string, resolvedPath: string): void {
   const claudeMdPath = nodePath.join(resolvedPath, "CLAUDE.md");
 
@@ -1337,6 +1359,8 @@ async function cmdInit(project: string, targetPath: string) {
     process.exit(1);
   }
 
+  const gitignoreCreated = writeGitignore(resolvedPath);
+
   const codingMemoryDir = nodePath.join(resolvedPath, ".coding-memory");
   nodeFs.mkdirSync(codingMemoryDir, { recursive: true });
 
@@ -1365,6 +1389,9 @@ async function cmdInit(project: string, targetPath: string) {
   const backendOk = await verifyBackendConnection(project);
 
   console.log("");
+  if (gitignoreCreated) {
+    console.log("✓ .gitignore created");
+  }
   console.log("✓ Git hook installed");
   console.log("✓ MCP server registered");
   console.log("✓ CLAUDE.md written");
