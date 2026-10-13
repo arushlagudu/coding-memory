@@ -617,13 +617,19 @@ async function cmdSearch(project: string, query: string) {
 // --- cm resolve ------------------------------------------------------------
 
 async function cmdResolve(project: string, memoryId: string) {
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("memories")
     .update({ resolved: true })
     .eq("project", project)
-    .eq("id", memoryId);
+    .eq("id", memoryId)
+    .select("id");
 
   if (error) fail(`Failed to resolve memory: ${error.message}`);
+
+  if (!data || data.length === 0) {
+    console.log(`No memory found with ID [${memoryId}]`);
+    return;
+  }
 
   console.log(`Resolved memory [${memoryId}]`);
 }
@@ -638,13 +644,19 @@ async function cmdDelete(project: string, memoryId: string) {
 
   if (linksError) fail(`Failed to delete memory links: ${linksError.message}`);
 
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("memories")
     .delete()
     .eq("project", project)
-    .eq("id", memoryId);
+    .eq("id", memoryId)
+    .select("id");
 
   if (error) fail(`Failed to delete memory: ${error.message}`);
+
+  if (!data || data.length === 0) {
+    console.log(`No memory found with ID [${memoryId}]`);
+    return;
+  }
 
   console.log(`Deleted memory [${memoryId}]`);
 }
