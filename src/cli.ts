@@ -544,6 +544,10 @@ async function cmdCompress(project: string) {
 // --- cm fix --------------------------------------------------------------
 
 async function cmdFix(project: string, problem: string, solution: string) {
+  if (problem.trim().length === 0 || solution.trim().length === 0) {
+    fail("Problem and solution cannot be empty.");
+  }
+
   const { error } = await supabase
     .from("execution_log")
     .insert({ project, problem, solution, resolved: false, device_id: getDeviceId() });
@@ -1078,6 +1082,8 @@ dist/
 .DS_Store
 *.log
 coverage/
+*-memories.json
+*.db
 `;
 
 // Returns true if the file was created, false if it already existed
