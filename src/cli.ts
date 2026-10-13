@@ -414,6 +414,11 @@ async function cmdSave(project: string, type: string, content: string, force = f
     fail(`Invalid memory type '${type}'. Valid types: decision, constraint, discovery, rejection.`);
   }
 
+  if (content.length > 500) {
+    fail(
+      `Memory content too long (${content.length} chars). Keep memories under 500 characters — they should be concise facts, not paragraphs.`
+    );
+  }
 
   const { data: existingRows, error: existingError } = await supabase
     .from("memories")
