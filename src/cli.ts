@@ -411,7 +411,7 @@ async function confirmSupersede(oldId: string, newContent: string): Promise<bool
 
 async function cmdSave(project: string, type: string, content: string, force = false) {
   if (!MEMORY_TYPES.includes(type as MemoryType)) {
-    fail(`Invalid type "${type}". Must be one of: ${MEMORY_TYPES.join(", ")}`);
+    fail(`Invalid memory type '${type}'. Valid types: decision, constraint, discovery, rejection.`);
   }
 
 
@@ -1355,7 +1355,7 @@ async function cmdInit(project: string, targetPath: string) {
   const gitDir = nodePath.join(resolvedPath, ".git");
 
   if (!nodeFs.existsSync(gitDir)) {
-    console.error(`No git repo found at ${targetPath}`);
+    console.error(`No git repo found at ${targetPath}. Run 'git init' first, then run 'cm init' again.`);
     process.exit(1);
   }
 
@@ -1885,12 +1885,23 @@ async function main() {
       let explicitProject: string | null;
       let type: string | undefined;
       let rest: string[];
-      if (MEMORY_TYPES.includes(positional[0] as MemoryType)) {
+      // Exactly two positional args can only mean <type> <content> with the
+      // project omitted — an explicit project would need a third slot for
+      // content, which wouldn't exist. Without this check, a typo'd type
+      // (failing the MEMORY_TYPES.includes test below) used to fall into
+      // the "explicit project" branch instead, shifting content out of
+      // existence and surfacing a generic usage() dump instead of the
+      // targeted invalid-type error.
+      if (positional.length === 2 || MEMORY_TYPES.includes(positional[0] as MemoryType)) {
         explicitProject = null;
         [type, ...rest] = positional;
       } else {
         explicitProject = positional[0] ?? null;
         [, type, ...rest] = positional;
+      }
+
+      if (type !== undefined && !MEMORY_TYPES.includes(type as MemoryType)) {
+        fail(`Invalid memory type '${type}'. Valid types: decision, constraint, discovery, rejection.`);
       }
 
       if (!type || rest.length === 0) usage();
