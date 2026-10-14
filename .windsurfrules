@@ -13,6 +13,7 @@
 - feat: cm doctor, cm undo, cm export, cm import — Phase 4 and 5 complete
 - fix: add --force to git hook saves to prevent interactive prompts during commits
 - feat: hosted Supabase backend, npm publish as stackmem, no env file required
+- docs: rewrite README to reflect current product v1.0.21
 - docs: final paper PDF with clean ASCII diagram and author name
 - docs: add full academic paper for arXiv submission
 - feat: hybrid scoring, richer seeding, entity extraction fixes, improved benchmarks
@@ -25,5 +26,5 @@
 - webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/13/2026, 5:37:12 PM*
+*Last updated: 10/13/2026, 9:34:26 PM*
 *Run `cm start` for full details with decay scores*
