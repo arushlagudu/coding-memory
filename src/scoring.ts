@@ -353,6 +353,41 @@ export function isQualityMessage(message: string): boolean {
   return true;
 }
 
+// --- conventional commit routing --------------------------------------------
+
+// Canonical reference implementation of the hook's conventional-commit
+// routing — the git hook (src/cli.ts buildHookLogicScript) keeps its own
+// inline copy since it runs standalone with no access to this module (same
+// reason isQualityMessage above is duplicated there). Keep the two in sync
+// by hand if this changes.
+const CONVENTIONAL_COMMIT_RE = /^([a-zA-Z]+)(\([^)]*\))?!?:\s*(.+)/;
+const CONVENTIONAL_DECISION_TYPES = new Set(["feat", "fix", "perf", "refactor"]);
+const CONVENTIONAL_SKIP_TYPES = new Set(["docs", "style", "test", "ci", "build", "chore"]);
+
+export type ConventionalCommitRoute = "decision" | "skip" | null;
+
+// Classifies a commit's SUBJECT line only — "decision" for feat/fix/perf/
+// refactor, "skip" for docs/style/test/ci/build/chore, or null if the
+// subject doesn't start with a recognized conventional-commit type (in
+// which case the caller falls back to isQualityMessage).
+export function classifyConventionalCommit(message: string): ConventionalCommitRoute {
+  const firstLine = message.trim().split("\n")[0];
+  const match = firstLine.match(CONVENTIONAL_COMMIT_RE);
+  if (!match) return null;
+
+  const type = match[1].toLowerCase();
+  if (CONVENTIONAL_DECISION_TYPES.has(type)) return "decision";
+  if (CONVENTIONAL_SKIP_TYPES.has(type)) return "skip";
+  return null;
+}
+
+// Whether the commit message's footer declares a breaking change — this
+// check is independent of (and additive to) classifyConventionalCommit's
+// type-based routing above.
+export function hasBreakingChangeFooter(message: string): boolean {
+  return /BREAKING CHANGE:\s*[\s\S]+/.test(message.trim());
+}
+
 // --- session-end classification ---------------------------------------------
 
 const FAILURE_PHRASES = ["failed", "didn't work", "reverted", "switched away"];
@@ -364,6 +399,59 @@ export function indicatesFailedApproach(text: string): boolean {
 
 export function isAuthRelatedFile(filePath: string): boolean {
   return /(auth|login|session|token)/i.test(filePath);
+}
+
+// --- secret redaction ----------------------------------------------------
+
+// Patterns whose entire match is replaced outright — each one is specific
+// enough (AWS key prefix, a labeled api_key field, a Bearer auth header, a
+// PEM private key header, a KEY=value .env line) that a false positive is
+// unlikely enough to risk leaving the value in place.
+const SECRET_PATTERNS: RegExp[] = [
+  /AKIA[0-9A-Z]{16}/g,
+  /(api[_-]?key|apikey)\s*[:=]\s*["']?[\w-]{20,}["']?/gi,
+  /bearer\s+[a-zA-Z0-9\-._~+/]+=*/gi,
+  /-----BEGIN [A-Z ]+PRIVATE KEY-----/g,
+  /^[A-Z_]+=.{8,}/gm,
+];
+
+// A bare 40+ char base64-ish string is common enough in non-secret content
+// (hashes, ids) that it needs a second signal before redacting: Shannon
+// entropy per character. Random secrets sit well above ~4.5 bits/char;
+// lower-entropy lookalikes (repeated or structured text) are left alone.
+const HIGH_ENTROPY_RE = /[a-zA-Z0-9+/]{40,}={0,2}/g;
+const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 4.5;
+
+function shannonEntropy(text: string): number {
+  if (text.length === 0) return 0;
+
+  const counts = new Map<string, number>();
+  for (const char of text) {
+    counts.set(char, (counts.get(char) ?? 0) + 1);
+  }
+
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / text.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+// Strips likely secrets (AWS keys, API keys, bearer tokens, private key
+// headers, .env assignments, and high-entropy strings) before content is
+// saved anywhere — a memory, a fix, or the hook's own printed summary.
+export function redactSecrets(content: string): string {
+  let result = content;
+  for (const pattern of SECRET_PATTERNS) {
+    result = result.replace(pattern, "[REDACTED]");
+  }
+
+  result = result.replace(HIGH_ENTROPY_RE, (match) =>
+    shannonEntropy(match) > HIGH_ENTROPY_MIN_BITS_PER_CHAR ? "[REDACTED]" : match
+  );
+
+  return result;
 }
 
 export function isCodeFile(filePath: string): boolean {

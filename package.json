@@ -14,7 +14,8 @@
   "scripts": {
     "dev": "tsx src/index.ts",
     "cli": "tsx src/cli.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test": "tsx --test src/tests/*.test.ts"
   },
   "keywords": [],
   "author": "",

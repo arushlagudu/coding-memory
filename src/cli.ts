@@ -2,9 +2,11 @@
 import nodeFs from "node:fs";
 import nodeOs from "node:os";
 import nodePath from "node:path";
-import { fileURLToPath } from "node:url";
+import { randomInt } from "node:crypto";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { analyzeCodebase } from "./ast-index.js";
+import { VAULT_URL } from "./config.js";
 import { getDeviceId } from "./device.js";
 import {
   applyContextBudget,
@@ -19,6 +21,7 @@ import {
   isAuthRelatedFile,
   isCodeFile,
   isQualityMessage,
+  redactSecrets,
   scoreMemoryRelevance,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
@@ -31,6 +34,14 @@ const CLI_PATH = fileURLToPath(import.meta.url);
 // hook's stripped-down shell environment.
 const DIST_CLI_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", "cli.js");
 const DIST_INDEX_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", "index.js");
+
+// Written into every file/hook stackmem manages, so `cm uninstall` (and the
+// hook installer's chaining check) can tell "ours, safe to remove/replace"
+// apart from a user's own pre-existing file/hook with the same name.
+const STACKMEM_HOOK_MARKER = "# stackmem-managed";
+const CLAUDE_MD_MARKER = "the stackmem MCP server will automatically load memories for this project";
+const RULES_FILE_MARKER = "# stackmem — project memory (auto-updated)";
+const HOOK_BACKUP_FILENAME = "post-commit.pre-stackmem";
 
 const MEMORY_TYPES = ["decision", "rejection", "constraint", "discovery"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
@@ -54,10 +65,12 @@ function usage(): never {
   cm inspect [project] <memory-id>
   cm compress [project]
   cm init <project> <path>
+  cm uninstall [project] [path]
+  cm link
   cm sync
   cm context [--project <name>] <task>
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
-  cm doctor
+  cm doctor [--fix]
   cm undo [project]
   cm export [filename]
   cm import [project] <filename>
@@ -131,6 +144,24 @@ function cmdHelp() {
       exist. The post-commit hook keeps them fresh afterward by
       running 'cm sync' on every commit.
 
+  cm uninstall [project] [path]
+      Remove everything 'cm init' set up at <path> (defaults to the
+      current directory): the git post-commit hook (restoring whatever
+      hook it chained after, if any), .coding-memory/post-commit-hook.mjs,
+      .coding-memory/ast-index.db and the .coding-memory/ directory
+      itself if left empty, the .stackmem file, and CLAUDE.md /
+      .cursorrules / .windsurfrules — the last three only if they still
+      carry the stackmem marker, so hand-edited files are left alone.
+      Also removes the stackmem entry from ~/.claude.json's mcpServers.
+      [project] defaults to the .stackmem file at <path> if omitted.
+
+  cm link
+      Connect this device to your GitHub account in the hosted vault.
+      Prints a 6-digit code, then waits for you to enter it at
+      stackmem-vault.vercel.app/link while signed in. The code is
+      single-use and expires after 10 minutes; polling stops when it
+      does. Links are per-device, so run this once on each machine.
+
   cm sync
       Regenerate .cursorrules and .windsurfrules from the project's
       current unresolved memories (decay-ranked, capped at a 2000
@@ -154,10 +185,16 @@ function cmdHelp() {
       (project, summary, errors_encountered, files_touched,
       approaches_tried) when stdin is piped rather than a terminal.
 
-  cm doctor
+  cm doctor [--fix]
       Check every integration point in the current directory — backend
       connection, MCP registration, .stackmem, git hook, and memory
-      count — and report what's working and what's broken.
+      count — and report what's working and what's broken. With --fix,
+      attempt a repair after each failing check: re-register the MCP
+      server, or re-install the git hook. A failed backend connection,
+      a missing .stackmem file, or no memories yet can't be auto-fixed
+      (they need a working network, 'cm init', or a commit respectively)
+      — those print guidance instead. Reports "Fixed: <item>" or
+      "Could not auto-fix: <item>" for each failing check.
 
   cm undo [project]
       Delete the most recently saved unresolved memory (and any
@@ -420,6 +457,11 @@ async function cmdSave(project: string, type: string, content: string, force = f
     );
   }
 
+  // Redacted before any further use — comparisons, prompts, and storage all
+  // see the scrubbed text, so a secret never round-trips through a console
+  // prompt (confirmSupersede) or ends up persisted.
+  content = redactSecrets(content);
+
   const { data: existingRows, error: existingError } = await supabase
     .from("memories")
     .select("id, content")
@@ -552,6 +594,9 @@ async function cmdFix(project: string, problem: string, solution: string) {
   if (problem.trim().length === 0 || solution.trim().length === 0) {
     fail("Problem and solution cannot be empty.");
   }
+
+  problem = redactSecrets(problem);
+  solution = redactSecrets(solution);
 
   const { error } = await supabase
     .from("execution_log")
@@ -780,8 +825,13 @@ async function cmdInspect(project: string, memoryId: string) {
 function buildHookLogicScript(cliPath: string): string {
   return `#!/usr/bin/env node
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, appendFileSync, mkdirSync } from "node:fs";
+import { join, dirname } from "node:path";
+
+// The hook must never block or break a commit: a slow or throwing hook body
+// is worse than a skipped one. runHook() does the real work; main() races
+// it against a 2s timeout and logs (rather than surfaces) any failure.
+const HOOK_TIMEOUT_MS = 2000;
 
 const stackmemPath = join(process.cwd(), ".stackmem");
 let PROJECT;
@@ -792,6 +842,58 @@ try {
 }
 
 const CLI_PATH = ${JSON.stringify(cliPath)};
+
+const SECRET_PATTERNS = [
+  /AKIA[0-9A-Z]{16}/g,
+  /(api[_-]?key|apikey)\\s*[:=]\\s*["']?[\\w-]{20,}["']?/gi,
+  /bearer\\s+[a-zA-Z0-9\\-._~+/]+=*/gi,
+  /-----BEGIN [A-Z ]+PRIVATE KEY-----/g,
+  /^[A-Z_]+=.{8,}/gm,
+];
+
+const HIGH_ENTROPY_RE = /[a-zA-Z0-9+/]{40,}={0,2}/g;
+const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 4.5;
+
+function shannonEntropy(text) {
+  if (text.length === 0) return 0;
+  const counts = new Map();
+  for (const char of text) {
+    counts.set(char, (counts.get(char) ?? 0) + 1);
+  }
+  let entropy = 0;
+  for (const count of counts.values()) {
+    const p = count / text.length;
+    entropy -= p * Math.log2(p);
+  }
+  return entropy;
+}
+
+// Inlined copy of src/scoring.ts's redactSecrets — this script runs
+// standalone via git's post-commit, with no import access to that module.
+function redactSecrets(content) {
+  let result = content;
+  for (const pattern of SECRET_PATTERNS) {
+    result = result.replace(pattern, "[REDACTED]");
+  }
+  result = result.replace(HIGH_ENTROPY_RE, (match) =>
+    shannonEntropy(match) > HIGH_ENTROPY_MIN_BITS_PER_CHAR ? "[REDACTED]" : match
+  );
+  return result;
+}
+
+function logHookError(error) {
+  try {
+    const logPath = join(process.cwd(), ".coding-memory", "hook.log");
+    mkdirSync(dirname(logPath), { recursive: true });
+    const message = error instanceof Error ? (error.stack || error.message) : String(error);
+    appendFileSync(logPath, \`[\${new Date().toISOString()}] \${message}\\n\`);
+  } catch {
+    // Logging itself failed — nothing more we can safely do without
+    // risking the commit, so give up silently.
+  }
+}
+
+async function runHook() {
 
 function git(args) {
   return execFileSync("git", args, { encoding: "utf-8" }).trim();
@@ -867,7 +969,7 @@ const commitMessage = git(["log", "-1", "--pretty=%B"]);
 // save its own commit message as a new decision memory, which changes the
 // rules-file content and triggers another sync commit, indefinitely.
 if (commitMessage.includes("[skip ci]")) {
-  process.exit(0);
+  return;
 }
 
 const isFirstCommit = (() => {
@@ -917,17 +1019,17 @@ for (const line of isFirstCommit ? [] : lines) {
 
     if (isNewFile) {
       if (/(auth|login|session|token)/i.test(currentFile)) {
-        const content = \`new auth-related file: \${currentFile}\`;
+        const content = redactSecrets(\`new auth-related file: \${currentFile}\`);
         cmSave("discovery", content);
         savedItems.push(\`discovery: \${content}\`);
       }
       if (isConfigFile(currentFile)) {
-        const content = \`new config: \${currentFile}\`;
+        const content = redactSecrets(\`new config: \${currentFile}\`);
         cmSave("constraint", content);
         savedItems.push(\`constraint: \${content}\`);
       }
       if (isSchemaFile(currentFile)) {
-        const content = \`schema change: \${currentFile}\`;
+        const content = redactSecrets(\`schema change: \${currentFile}\`);
         cmSave("discovery", content);
         savedItems.push(\`discovery: \${content}\`);
       }
@@ -964,7 +1066,7 @@ for (const line of isFirstCommit ? [] : lines) {
         : null;
 
     if (removedModulePath) {
-      const content = \`removed dependency: \${removedModulePath}\`;
+      const content = redactSecrets(\`removed dependency: \${removedModulePath}\`);
       cmSave("rejection", content);
       savedItems.push(\`rejection: \${content}\`);
     }
@@ -972,7 +1074,7 @@ for (const line of isFirstCommit ? [] : lines) {
     if (isPackageJson && inDependenciesSection) {
       const pkgMatch = codeLine.match(/"([a-z][\\w-]+)"\\s*:/);
       if (pkgMatch && pkgMatch[1] !== "dependencies" && pkgMatch[1] !== "devDependencies") {
-        const content = \`removed dependency: \${pkgMatch[1]}\`;
+        const content = redactSecrets(\`removed dependency: \${pkgMatch[1]}\`);
         cmSave("rejection", content);
         savedItems.push(\`rejection: \${content}\`);
       }
@@ -988,7 +1090,7 @@ for (const line of isFirstCommit ? [] : lines) {
       if (base === ".env" || base === ".env.example") {
         const envMatch = codeLine.match(/([A-Z_]{3,})=/);
         if (envMatch) {
-          const content = \`new env var required: \${envMatch[1]}\`;
+          const content = redactSecrets(\`new env var required: \${envMatch[1]}\`);
           cmSave("constraint", content);
           savedItems.push(\`constraint: \${content}\`);
         }
@@ -998,7 +1100,7 @@ for (const line of isFirstCommit ? [] : lines) {
     if (isPackageJson && inDependenciesSection) {
       const pkgMatch = codeLine.match(/"([a-z][\\w-]+)"\\s*:/);
       if (pkgMatch && pkgMatch[1] !== "dependencies" && pkgMatch[1] !== "devDependencies") {
-        const content = \`added dependency: \${pkgMatch[1]}\`;
+        const content = redactSecrets(\`added dependency: \${pkgMatch[1]}\`);
         cmSave("decision", content);
         savedItems.push(\`decision: \${content}\`);
       }
@@ -1006,24 +1108,55 @@ for (const line of isFirstCommit ? [] : lines) {
 
     if (currentFile && isSchemaFile(currentFile) && /CREATE TABLE|ALTER TABLE|DROP TABLE/i.test(codeLine)) {
       const truncated = codeLine.trim().slice(0, 80);
-      const content = \`database change: \${truncated}\`;
+      const content = redactSecrets(\`database change: \${truncated}\`);
       cmSave("discovery", content);
       savedItems.push(\`discovery: \${content}\`);
     }
 
     if (/^\\+\\s*(\\/\\/|#)\\s*(TODO:|FIXME:|HACK:|XXX:)/.test(line)) {
       const truncated = codeLine.trim().slice(0, 100);
-      const content = \`open issue from commit: \${truncated}\`;
+      const content = redactSecrets(\`open issue from commit: \${truncated}\`);
       cmSave("discovery", content);
       savedItems.push(\`discovery: \${content}\`);
     }
   }
 }
 
-// Saved last, after every diff-detected memory, and only if it clears the
-// quality filter — diff analysis always runs regardless of commit message.
-if (isQualityCommitMessage(commitMessage)) {
-  const trimmedMessage = commitMessage.trim();
+// Conventional-commit routing (handled last, after every diff-detected
+// memory — diff analysis always runs regardless of commit message):
+// feat/fix/perf/refactor save as a decision outright (the "type:" prefix is
+// itself the quality signal, so the generic filter below is bypassed);
+// docs/style/test/ci/build/chore are skipped entirely; a BREAKING CHANGE
+// footer always saves as a constraint, independent of (and in addition to)
+// the type-based routing above; anything that isn't a recognized
+// conventional-commit type at all falls back to the pre-existing
+// isQualityCommitMessage filter.
+const CONVENTIONAL_COMMIT_RE = /^([a-zA-Z]+)(\\([^)]*\\))?!?:\\s*(.+)/;
+const CONVENTIONAL_DECISION_TYPES = new Set(["feat", "fix", "perf", "refactor"]);
+const CONVENTIONAL_SKIP_TYPES = new Set(["docs", "style", "test", "ci", "build", "chore"]);
+const BREAKING_CHANGE_RE = /BREAKING CHANGE:\\s*([\\s\\S]+?)(?:\\n\\n|$)/;
+
+const trimmedCommitMessage = commitMessage.trim();
+const commitFirstLine = trimmedCommitMessage.split("\\n")[0];
+const conventionalMatch = commitFirstLine.match(CONVENTIONAL_COMMIT_RE);
+const conventionalType = conventionalMatch ? conventionalMatch[1].toLowerCase() : null;
+
+const breakingMatch = trimmedCommitMessage.match(BREAKING_CHANGE_RE);
+if (breakingMatch) {
+  const breakingContent = redactSecrets(breakingMatch[1].trim());
+  const content = \`BREAKING CHANGE: \${breakingContent}\`;
+  cmSave("constraint", content);
+  savedItems.push(\`constraint: \${content}\`);
+}
+
+if (conventionalType && CONVENTIONAL_DECISION_TYPES.has(conventionalType)) {
+  const trimmedMessage = redactSecrets(trimmedCommitMessage);
+  cmSave("decision", trimmedMessage);
+  savedItems.push(\`decision: \${trimmedMessage}\`);
+} else if (conventionalType && CONVENTIONAL_SKIP_TYPES.has(conventionalType)) {
+  // docs/style/test/ci/build/chore — skip entirely, nothing saved.
+} else if (isQualityCommitMessage(commitMessage)) {
+  const trimmedMessage = redactSecrets(trimmedCommitMessage);
   cmSave("decision", trimmedMessage);
   savedItems.push(\`decision: \${trimmedMessage}\`);
 }
@@ -1048,12 +1181,100 @@ try {
 } catch {
   // Nothing to commit (rules files unchanged) — fine, ignore.
 }
+}
+
+async function main() {
+  let timeoutHandle;
+  try {
+    await Promise.race([
+      runHook(),
+      new Promise((_resolve, reject) => {
+        timeoutHandle = setTimeout(
+          () => reject(new Error("stackmem post-commit hook exceeded " + HOOK_TIMEOUT_MS + "ms timeout")),
+          HOOK_TIMEOUT_MS
+        );
+      }),
+    ]);
+  } catch (error) {
+    logHookError(error);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+main().finally(() => process.exit(0));
 `;
 }
 
-function registerMcpServer(distIndexPath: string): void {
-  const claudeConfigPath = nodePath.join(nodeOs.homedir(), ".claude.json");
+// Installs (or re-installs) the stackmem post-commit hook at `hooksDir`. If
+// a post-commit hook already exists and wasn't written by stackmem, it's
+// preserved as a backup and chained to run before stackmem's own hook,
+// rather than being clobbered — see `uninstallHook` for how it's restored.
+function installHook(hooksDir: string, hookLogicPath: string): void {
+  nodeFs.mkdirSync(hooksDir, { recursive: true });
 
+  const hookPath = nodePath.join(hooksDir, "post-commit");
+  const backupPath = nodePath.join(hooksDir, HOOK_BACKUP_FILENAME);
+
+  let chainedOriginal = false;
+  if (nodeFs.existsSync(hookPath)) {
+    const existingContent = nodeFs.readFileSync(hookPath, "utf-8");
+    if (!existingContent.includes(STACKMEM_HOOK_MARKER)) {
+      nodeFs.copyFileSync(hookPath, backupPath);
+      try {
+        nodeFs.chmodSync(backupPath, 0o755);
+      } catch {
+        // Best-effort — if the original wasn't executable either, leave it.
+      }
+      chainedOriginal = true;
+    }
+  }
+
+  const chainLine = chainedOriginal
+    ? `"$(dirname "$0")/${HOOK_BACKUP_FILENAME}" "$@"\n`
+    : "";
+
+  nodeFs.writeFileSync(
+    hookPath,
+    `#!/bin/sh\n${STACKMEM_HOOK_MARKER}\n${chainLine}exec node "${hookLogicPath}" "$@"\n`,
+    "utf-8"
+  );
+  nodeFs.chmodSync(hookPath, 0o755);
+
+  if (chainedOriginal) {
+    console.log("Existing post-commit hook found — chained it to run before stackmem's hook.");
+  }
+}
+
+// Reverses `installHook`: if stackmem wrote the hook fresh, removes it; if
+// stackmem chained it after an existing hook, restores that original hook
+// in its place. Returns a description of what happened, or null if there
+// was no stackmem-managed hook to remove (nothing done).
+function uninstallHook(hooksDir: string): string | null {
+  const hookPath = nodePath.join(hooksDir, "post-commit");
+  const backupPath = nodePath.join(hooksDir, HOOK_BACKUP_FILENAME);
+
+  if (!nodeFs.existsSync(hookPath)) return null;
+
+  const content = nodeFs.readFileSync(hookPath, "utf-8");
+  if (!content.includes(STACKMEM_HOOK_MARKER)) return null;
+
+  if (nodeFs.existsSync(backupPath)) {
+    nodeFs.renameSync(backupPath, hookPath);
+    return ".git/hooks/post-commit (restored original hook stackmem had chained)";
+  }
+
+  nodeFs.unlinkSync(hookPath);
+  return ".git/hooks/post-commit";
+}
+
+// Overridable so tests (and `cm uninstall`'s own smoke-testing) can point
+// at a scratch file instead of the real ~/.claude.json.
+function getClaudeConfigPath(): string {
+  return nodePath.join(nodeOs.homedir(), ".claude.json");
+}
+
+function registerMcpServer(distIndexPath: string, claudeConfigPath = getClaudeConfigPath()): void {
   let config: { mcpServers?: Record<string, unknown> } = {};
   if (nodeFs.existsSync(claudeConfigPath)) {
     try {
@@ -1078,6 +1299,24 @@ function registerMcpServer(distIndexPath: string): void {
 
   nodeFs.writeFileSync(claudeConfigPath, JSON.stringify(config, null, 2), "utf-8");
   console.log("stackmem MCP server registered with Claude Code.");
+}
+
+// Returns true if an entry was actually removed.
+function unregisterMcpServer(claudeConfigPath = getClaudeConfigPath()): boolean {
+  if (!nodeFs.existsSync(claudeConfigPath)) return false;
+
+  let config: { mcpServers?: Record<string, unknown> } = {};
+  try {
+    config = JSON.parse(nodeFs.readFileSync(claudeConfigPath, "utf-8"));
+  } catch {
+    return false;
+  }
+
+  if (!config.mcpServers || !("stackmem" in config.mcpServers)) return false;
+
+  delete config.mcpServers.stackmem;
+  nodeFs.writeFileSync(claudeConfigPath, JSON.stringify(config, null, 2), "utf-8");
+  return true;
 }
 
 const DEFAULT_GITIGNORE_CONTENT = `node_modules/
@@ -1242,19 +1481,28 @@ function writeProjectFile(project: string, resolvedPath: string): void {
   nodeFs.writeFileSync(stackmemPath, `${project}\n`, "utf-8");
 }
 
+// Minimal shape trySeedMemory needs from a Supabase client — narrow enough
+// that tests can pass a mock without satisfying the full SupabaseClient type.
+interface MemoryInsertClient {
+  from(table: string): { insert(row: unknown): PromiseLike<{ error: unknown }> };
+}
+
 // Shared by every seedMemories check below: skip the insert if this exact
 // content already exists (decideSaveAction's duplicate check) so re-running
-// `cm init` on an already-seeded project doesn't pile up repeats.
-async function trySeedMemory(
+// `cm init` on an already-seeded project doesn't pile up repeats. Exported,
+// with an injectable client, so this duplicate-prevention guarantee is
+// unit-testable without a live Supabase connection.
+export async function trySeedMemory(
   project: string,
   existingMemories: { id: string; content: string }[],
   type: MemoryType,
-  content: string
+  content: string,
+  client: MemoryInsertClient = supabase
 ): Promise<boolean> {
   const decision = decideSaveAction(content, existingMemories);
   if (decision.action === "duplicate") return false;
 
-  const { error } = await supabase.from("memories").insert({
+  const { error } = await client.from("memories").insert({
     project,
     type,
     content,
@@ -1393,9 +1641,7 @@ async function cmdInit(project: string, targetPath: string) {
   const hooksDir = nodePath.join(gitDir, "hooks");
   nodeFs.mkdirSync(hooksDir, { recursive: true });
 
-  const hookPath = nodePath.join(hooksDir, "post-commit");
-  nodeFs.writeFileSync(hookPath, `#!/bin/sh\nexec node "${hookLogicPath}" "$@"\n`, "utf-8");
-  nodeFs.chmodSync(hookPath, 0o755);
+  installHook(hooksDir, hookLogicPath);
 
   console.log(`coding-memory hook installed for project ${project} at ${targetPath}`);
 
@@ -1451,6 +1697,92 @@ async function cmdSync(project: string) {
   nodeFs.writeFileSync(nodePath.join(resolvedPath, ".windsurfrules"), rulesContent, "utf-8");
 
   console.log("Synced memories to .cursorrules and .windsurfrules");
+}
+
+// --- cm link ---------------------------------------------------------------
+
+// Mirrors the link_codes.expires_at default in the migration
+// (supabase/migrations/001_user_devices_and_link_codes.sql in the vault repo).
+// If that interval changes, change this too — polling past expires_at just
+// burns requests against a row the API will refuse.
+const LINK_CODE_TTL_MS = 10 * 60 * 1000;
+const LINK_POLL_INTERVAL_MS = 3_000;
+const LINK_CODE_INSERT_ATTEMPTS = 5;
+const PG_UNIQUE_VIOLATION = "23505";
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// randomInt is a CSPRNG and uniform over the range. Math.random() would do
+// neither, and a link code is a short-lived credential for claiming this
+// device's memories — a guessable one is a hijack.
+function generateLinkCode(): string {
+  return String(randomInt(0, 1_000_000)).padStart(6, "0");
+}
+
+async function cmdLink() {
+  const deviceId = getDeviceId();
+
+  // A 6-digit space collides rarely, but only unclaimed codes occupy it and
+  // the primary key makes a collision a hard error rather than a silent
+  // overwrite — so retry with a fresh code instead of failing the command.
+  let code: string | null = null;
+  for (let attempt = 0; attempt < LINK_CODE_INSERT_ATTEMPTS; attempt++) {
+    const candidate = generateLinkCode();
+    const { error } = await supabase
+      .from("link_codes")
+      .insert({ code: candidate, device_id: deviceId });
+
+    if (!error) {
+      code = candidate;
+      break;
+    }
+    if (error.code !== PG_UNIQUE_VIOLATION) {
+      fail(`Failed to create a link code: ${error.message}`);
+    }
+  }
+
+  if (!code) {
+    fail("Could not get an unused link code. Try again in a minute.");
+  }
+
+  console.log(`Go to ${VAULT_URL}/link and enter code: ${code}`);
+  console.log("");
+  console.log("Waiting for the code to be claimed… (expires in 10 minutes)");
+
+  const deadline = Date.now() + LINK_CODE_TTL_MS;
+
+  while (Date.now() < deadline) {
+    await sleep(LINK_POLL_INTERVAL_MS);
+
+    const { data, error } = await supabase
+      .from("link_codes")
+      .select("claimed_at")
+      .eq("code", code)
+      .maybeSingle();
+
+    // A transient read failure shouldn't abandon a link the user may have
+    // already completed in the browser — keep polling until the code expires.
+    if (error) continue;
+
+    // The row is gone: either housekeeping swept it or it was never visible
+    // to this device. Either way there's nothing left to claim.
+    if (!data) break;
+
+    if (data.claimed_at) {
+      console.log("Device linked to your GitHub account.");
+
+      // Best-effort cleanup — the code is spent either way, and the API
+      // rejects claimed codes, so a failure here is harmless.
+      await supabase.from("link_codes").delete().eq("code", code);
+      return;
+    }
+  }
+
+  console.error("");
+  console.error("Link code expired before it was claimed. Run 'cm link' again.");
+  process.exit(1);
 }
 
 // --- cm context ------------------------------------------------------------
@@ -1670,7 +2002,29 @@ async function cmdSessionEndEntry(args: string[]) {
 
 // --- cm doctor ---------------------------------------------------------
 
-async function cmdDoctor() {
+// Re-reads the freshly (re)written config to confirm the MCP entry is
+// actually there now, rather than trusting registerMcpServer didn't throw.
+function isMcpRegistered(claudeConfigPath: string): boolean {
+  if (!nodeFs.existsSync(claudeConfigPath)) return false;
+  try {
+    const config = JSON.parse(nodeFs.readFileSync(claudeConfigPath, "utf-8"));
+    return Boolean(config?.mcpServers?.stackmem);
+  } catch {
+    return false;
+  }
+}
+
+function isHookExecutable(hookPath: string): boolean {
+  if (!nodeFs.existsSync(hookPath)) return false;
+  try {
+    nodeFs.accessSync(hookPath, nodeFs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cmdDoctor(fix: boolean) {
   let issues = 0;
   const project = readProjectFromFile();
 
@@ -1681,24 +2035,30 @@ async function cmdDoctor() {
   } else {
     console.log("✗ Backend connection failed — check your network");
     issues++;
+    if (fix) {
+      console.log(
+        "Could not auto-fix: backend connection — check your network and Supabase status, then re-run 'cm doctor'."
+      );
+    }
   }
 
   // 2. MCP server registration
-  const claudeConfigPath = nodePath.join(nodeOs.homedir(), ".claude.json");
-  let mcpRegistered = false;
-  if (nodeFs.existsSync(claudeConfigPath)) {
-    try {
-      const config = JSON.parse(nodeFs.readFileSync(claudeConfigPath, "utf-8"));
-      mcpRegistered = Boolean(config?.mcpServers?.stackmem);
-    } catch {
-      mcpRegistered = false;
-    }
-  }
+  const claudeConfigPath = getClaudeConfigPath();
+  const mcpRegistered = isMcpRegistered(claudeConfigPath);
   if (mcpRegistered) {
     console.log("✓ MCP server registered with Claude Code");
   } else {
     console.log("✗ MCP server not registered — run 'cm init <project> .'");
     issues++;
+    if (fix) {
+      registerMcpServer(DIST_INDEX_PATH, claudeConfigPath);
+      if (isMcpRegistered(claudeConfigPath)) {
+        console.log("Fixed: MCP server registration");
+        issues--;
+      } else {
+        console.log("Could not auto-fix: MCP server registration");
+      }
+    }
   }
 
   // 3. Project file
@@ -1707,6 +2067,9 @@ async function cmdDoctor() {
   } else {
     console.log("✗ No .stackmem found — run 'cm init <project> .'");
     issues++;
+    if (fix) {
+      console.log("Could not auto-fix: .stackmem file — run 'cm init <project> .'");
+    }
   }
 
   // 4. Git hook
@@ -1715,25 +2078,33 @@ async function cmdDoctor() {
     console.log("✗ No git repo found in current directory");
     issues++;
   } else {
-    const hookPath = nodePath.join(gitDir, "hooks", "post-commit");
-    let hookExecutable = false;
-    if (nodeFs.existsSync(hookPath)) {
-      try {
-        nodeFs.accessSync(hookPath, nodeFs.constants.X_OK);
-        hookExecutable = true;
-      } catch {
-        hookExecutable = false;
-      }
-    }
-    if (hookExecutable) {
+    const hooksDir = nodePath.join(gitDir, "hooks");
+    const hookPath = nodePath.join(hooksDir, "post-commit");
+
+    if (isHookExecutable(hookPath)) {
       console.log("✓ Git hook installed");
     } else {
       console.log("✗ Git hook not installed — run 'cm init <project> .'");
       issues++;
+      if (fix) {
+        const codingMemoryDir = nodePath.join(process.cwd(), ".coding-memory");
+        nodeFs.mkdirSync(codingMemoryDir, { recursive: true });
+        const hookLogicPath = nodePath.join(codingMemoryDir, "post-commit-hook.mjs");
+        nodeFs.writeFileSync(hookLogicPath, buildHookLogicScript(DIST_CLI_PATH), "utf-8");
+        installHook(hooksDir, hookLogicPath);
+
+        if (isHookExecutable(hookPath)) {
+          console.log("Fixed: git hook");
+          issues--;
+        } else {
+          console.log("Could not auto-fix: git hook");
+        }
+      }
     }
   }
 
   // 5. Memory count
+  let hasMemories = false;
   if (project) {
     const { count, error } = await supabase
       .from("memories")
@@ -1741,15 +2112,17 @@ async function cmdDoctor() {
       .eq("project", project)
       .eq("resolved", false);
 
-    if (!error && (count ?? 0) > 0) {
+    hasMemories = !error && (count ?? 0) > 0;
+    if (hasMemories) {
       console.log(`✓ ${count} memories stored for "${project}"`);
-    } else {
-      console.log(`✗ No memories yet — make a commit to start capturing`);
-      issues++;
     }
-  } else {
+  }
+  if (!hasMemories) {
     console.log(`✗ No memories yet — make a commit to start capturing`);
     issues++;
+    if (fix) {
+      console.log("Could not auto-fix: memories — make a commit to start capturing");
+    }
   }
 
   console.log("");
@@ -1885,6 +2258,75 @@ async function cmdImport(project: string, filename: string) {
   console.log(`Imported ${importedCount} memories from ${filename}`);
 }
 
+// --- cm uninstall ------------------------------------------------------
+
+function readProjectFromPath(dirPath: string): string | null {
+  const stackmemPath = nodePath.join(dirPath, STACKMEM_FILE);
+  if (!nodeFs.existsSync(stackmemPath)) return null;
+  const content = nodeFs.readFileSync(stackmemPath, "utf-8").trim();
+  return content.length > 0 ? content : null;
+}
+
+// Removes a marker-gated file (CLAUDE.md / .cursorrules / .windsurfrules)
+// only if it still carries the stackmem marker — a file the user has since
+// rewritten by hand, or never had stackmem's content to begin with, is left
+// alone rather than silently deleted.
+function removeIfMarked(filePath: string, marker: string, label: string): void {
+  if (!nodeFs.existsSync(filePath)) return;
+
+  const content = nodeFs.readFileSync(filePath, "utf-8");
+  if (!content.includes(marker)) {
+    console.log(`Skipped ${label} (no stackmem marker found — left as-is).`);
+    return;
+  }
+
+  nodeFs.unlinkSync(filePath);
+  console.log(`Removed ${label}`);
+}
+
+async function cmdUninstall(project: string, targetPath: string) {
+  const gitDir = nodePath.join(targetPath, ".git");
+  const hooksDir = nodePath.join(gitDir, "hooks");
+
+  const hookResult = uninstallHook(hooksDir);
+  if (hookResult) console.log(`Removed ${hookResult}`);
+
+  const codingMemoryDir = nodePath.join(targetPath, ".coding-memory");
+
+  const hookLogicPath = nodePath.join(codingMemoryDir, "post-commit-hook.mjs");
+  if (nodeFs.existsSync(hookLogicPath)) {
+    nodeFs.unlinkSync(hookLogicPath);
+    console.log("Removed .coding-memory/post-commit-hook.mjs");
+  }
+
+  const astDbPath = nodePath.join(codingMemoryDir, "ast-index.db");
+  if (nodeFs.existsSync(astDbPath)) {
+    nodeFs.unlinkSync(astDbPath);
+    console.log("Removed .coding-memory/ast-index.db");
+  }
+
+  if (nodeFs.existsSync(codingMemoryDir) && nodeFs.readdirSync(codingMemoryDir).length === 0) {
+    nodeFs.rmdirSync(codingMemoryDir);
+    console.log("Removed .coding-memory/ directory");
+  }
+
+  const stackmemPath = nodePath.join(targetPath, STACKMEM_FILE);
+  if (nodeFs.existsSync(stackmemPath)) {
+    nodeFs.unlinkSync(stackmemPath);
+    console.log("Removed .stackmem");
+  }
+
+  removeIfMarked(nodePath.join(targetPath, "CLAUDE.md"), CLAUDE_MD_MARKER, "CLAUDE.md");
+  removeIfMarked(nodePath.join(targetPath, ".cursorrules"), RULES_FILE_MARKER, ".cursorrules");
+  removeIfMarked(nodePath.join(targetPath, ".windsurfrules"), RULES_FILE_MARKER, ".windsurfrules");
+
+  if (unregisterMcpServer()) {
+    console.log("Removed stackmem entry from ~/.claude.json mcpServers");
+  }
+
+  console.log(`stackmem uninstalled from ${project}.`);
+}
+
 // --- main --------------------------------------------------------------
 
 async function main() {
@@ -1992,6 +2434,12 @@ async function main() {
       await cmdInit(project, targetPath);
       break;
     }
+    // Device-scoped, not project-scoped — no .stackmem lookup here.
+    case "link": {
+      if (args.length > 0) usage();
+      await cmdLink();
+      break;
+    }
     case "sync": {
       if (args.length > 0) usage();
       const project = requireProject(null);
@@ -2010,7 +2458,8 @@ async function main() {
       break;
     }
     case "doctor": {
-      await cmdDoctor();
+      const fix = args.includes("--fix");
+      await cmdDoctor(fix);
       break;
     }
     case "undo": {
@@ -2035,6 +2484,31 @@ async function main() {
       await cmdImport(project, filename);
       break;
     }
+    case "uninstall": {
+      if (args.length > 2) usage();
+
+      let explicitProject: string | null = null;
+      let targetPath = process.cwd();
+      if (args.length === 1) {
+        if (looksLikeAPath(args[0])) {
+          targetPath = args[0];
+        } else {
+          explicitProject = args[0];
+        }
+      } else if (args.length === 2) {
+        [explicitProject, targetPath] = args;
+      }
+
+      const resolvedPath = nodePath.resolve(targetPath);
+      const project = explicitProject ?? readProjectFromPath(resolvedPath);
+      if (!project) {
+        console.error(`No project specified and no .stackmem file found at ${resolvedPath}.`);
+        process.exit(1);
+      }
+
+      await cmdUninstall(project, resolvedPath);
+      break;
+    }
     case "help": {
       cmdHelp();
       break;
@@ -2044,6 +2518,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  fail(error instanceof Error ? error.message : String(error));
-});
+// Guards the auto-run so importing this module (e.g. from a test file, to
+// reach exported helpers like trySeedMemory) doesn't also execute main()
+// against the test runner's own argv.
+const isMainModule = process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  main().catch((error) => {
+    fail(error instanceof Error ? error.message : String(error));
+  });
+}
