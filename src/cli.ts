@@ -2,11 +2,9 @@
 import nodeFs from "node:fs";
 import nodeOs from "node:os";
 import nodePath from "node:path";
-import { randomInt } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { analyzeCodebase } from "./ast-index.js";
-import { VAULT_URL } from "./config.js";
 import { getDeviceId } from "./device.js";
 import {
   applyContextBudget,
@@ -66,7 +64,6 @@ function usage(): never {
   cm compress [project]
   cm init <project> <path>
   cm uninstall [project] [path]
-  cm link
   cm sync
   cm context [--project <name>] <task>
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
@@ -154,13 +151,6 @@ function cmdHelp() {
       carry the stackmem marker, so hand-edited files are left alone.
       Also removes the stackmem entry from ~/.claude.json's mcpServers.
       [project] defaults to the .stackmem file at <path> if omitted.
-
-  cm link
-      Connect this device to your GitHub account in the hosted vault.
-      Prints a 6-digit code, then waits for you to enter it at
-      stackmem-vault.vercel.app/link while signed in. The code is
-      single-use and expires after 10 minutes; polling stops when it
-      does. Links are per-device, so run this once on each machine.
 
   cm sync
       Regenerate .cursorrules and .windsurfrules from the project's
@@ -1699,92 +1689,6 @@ async function cmdSync(project: string) {
   console.log("Synced memories to .cursorrules and .windsurfrules");
 }
 
-// --- cm link ---------------------------------------------------------------
-
-// Mirrors the link_codes.expires_at default in the migration
-// (supabase/migrations/001_user_devices_and_link_codes.sql in the vault repo).
-// If that interval changes, change this too — polling past expires_at just
-// burns requests against a row the API will refuse.
-const LINK_CODE_TTL_MS = 10 * 60 * 1000;
-const LINK_POLL_INTERVAL_MS = 3_000;
-const LINK_CODE_INSERT_ATTEMPTS = 5;
-const PG_UNIQUE_VIOLATION = "23505";
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-// randomInt is a CSPRNG and uniform over the range. Math.random() would do
-// neither, and a link code is a short-lived credential for claiming this
-// device's memories — a guessable one is a hijack.
-function generateLinkCode(): string {
-  return String(randomInt(0, 1_000_000)).padStart(6, "0");
-}
-
-async function cmdLink() {
-  const deviceId = getDeviceId();
-
-  // A 6-digit space collides rarely, but only unclaimed codes occupy it and
-  // the primary key makes a collision a hard error rather than a silent
-  // overwrite — so retry with a fresh code instead of failing the command.
-  let code: string | null = null;
-  for (let attempt = 0; attempt < LINK_CODE_INSERT_ATTEMPTS; attempt++) {
-    const candidate = generateLinkCode();
-    const { error } = await supabase
-      .from("link_codes")
-      .insert({ code: candidate, device_id: deviceId });
-
-    if (!error) {
-      code = candidate;
-      break;
-    }
-    if (error.code !== PG_UNIQUE_VIOLATION) {
-      fail(`Failed to create a link code: ${error.message}`);
-    }
-  }
-
-  if (!code) {
-    fail("Could not get an unused link code. Try again in a minute.");
-  }
-
-  console.log(`Go to ${VAULT_URL}/link and enter code: ${code}`);
-  console.log("");
-  console.log("Waiting for the code to be claimed… (expires in 10 minutes)");
-
-  const deadline = Date.now() + LINK_CODE_TTL_MS;
-
-  while (Date.now() < deadline) {
-    await sleep(LINK_POLL_INTERVAL_MS);
-
-    const { data, error } = await supabase
-      .from("link_codes")
-      .select("claimed_at")
-      .eq("code", code)
-      .maybeSingle();
-
-    // A transient read failure shouldn't abandon a link the user may have
-    // already completed in the browser — keep polling until the code expires.
-    if (error) continue;
-
-    // The row is gone: either housekeeping swept it or it was never visible
-    // to this device. Either way there's nothing left to claim.
-    if (!data) break;
-
-    if (data.claimed_at) {
-      console.log("Device linked to your GitHub account.");
-
-      // Best-effort cleanup — the code is spent either way, and the API
-      // rejects claimed codes, so a failure here is harmless.
-      await supabase.from("link_codes").delete().eq("code", code);
-      return;
-    }
-  }
-
-  console.error("");
-  console.error("Link code expired before it was claimed. Run 'cm link' again.");
-  process.exit(1);
-}
-
 // --- cm context ------------------------------------------------------------
 
 const CONTEXT_TYPE_ORDER: MemoryType[] = ["decision", "constraint", "rejection", "discovery"];
@@ -2432,12 +2336,6 @@ async function main() {
       const [project, targetPath] = args;
       if (!project || !targetPath) usage();
       await cmdInit(project, targetPath);
-      break;
-    }
-    // Device-scoped, not project-scoped — no .stackmem lookup here.
-    case "link": {
-      if (args.length > 0) usage();
-      await cmdLink();
       break;
     }
     case "sync": {
