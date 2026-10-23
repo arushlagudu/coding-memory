@@ -22,20 +22,18 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 - TypeScript config: target=ES2022, module=Node16
 
 ### Rejections
-- removed dependency: node:path
-- removed dependency: node:fs
+- removed dependency: ./config.js
 
 ### Discoveries
 - project description: # stackmem Persistent memory for AI coding agents. Zero config. Installs in 60 seconds. ## The problem Every session with an AI coding agent starts from zero. You re-explain the same stack, the same constraints, the same "we tried that and it didn't work" — and the agent repeats mistakes it already made last week, because nothing it learned last session survived the chat closing. ## Install ``` npm install -g stackmem ``` ## Setup ``` cd myproject cm init myapp . ``` ``` ✓ .gitignore created ✓ Git hook installed ✓ MCP server registered ✓ CLAUDE.md written ✓ .cursorrules
 - tech stack: @modelcontextprotocol/sdk, @supabase/supabase-js, better-sqlite3, tree-sitter, tree-sitter-javascript, tree-sitter-typescript, zod, @types/better-sqlite3, @types/node, tsx, typescript
 - open issue from commit: // TODO: optimize the clustering algorithm
 - open issue from commit: if (/TODO:|FIXME:|HACK:|XXX:/.test(codeLine)) {
-- [REJECTION cluster] node:fs: removed dependency: node:fs; removed dependency: node:path; removed dependency: node:url
-- [DECISION cluster] chore: chore: remove dist from git tracking, add to gitignore; chore: remove exported memories file, ignore memory exports; chore: remove dist from git, fix TODO detection to comments 
+- [DISCOVERY cluster] cluster: [DECISION cluster] chore: chore: remove dist from git tracki; [REJECTION cluster] node:fs: removed dependency: node:fs; re; [REJECTION cluster] node:path: removed dependency: node:path
 
 ### Recent Fixes
 - webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/21/2026, 8:03:47 PM*
+*Last updated: 10/22/2026, 8:23:30 PM*
 *Run `cm start` for full details with decay scores*
