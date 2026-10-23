@@ -2418,8 +2418,21 @@ async function main() {
 
 // Guards the auto-run so importing this module (e.g. from a test file, to
 // reach exported helpers like trySeedMemory) doesn't also execute main()
-// against the test runner's own argv.
-const isMainModule = process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href;
+// against the test runner's own argv. realpathSync matters here: the `cm`
+// bin is typically a symlink (npm link, or the global install this project
+// itself uses), and process.argv[1] preserves the symlink path as invoked
+// while import.meta.url resolves to the link's real target — comparing
+// them raw would never match, silently skipping main() entirely.
+function resolveMainModulePath(argvPath: string): string | null {
+  try {
+    return pathToFileURL(nodeFs.realpathSync(argvPath)).href;
+  } catch {
+    return null;
+  }
+}
+
+const isMainModule =
+  process.argv[1] != null && import.meta.url === resolveMainModulePath(process.argv[1]);
 if (isMainModule) {
   main().catch((error) => {
     fail(error instanceof Error ? error.message : String(error));
