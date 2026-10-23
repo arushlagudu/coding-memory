@@ -1,0 +1,42 @@
+[2026-10-22T01:50:24.644Z] Error: Command failed: node /Users/aruna/coding-memory/coding-memory/dist/cli.js save coding-memory decision fix: remove cm link code accidentally swept into the Phase 0 commit
+
+cmdLink, its config.ts/storage.ts VAULT_URL and link_codes dependencies,
+and the "link" CLI case were mid-development in the working tree and got
+included by a broad `git add` — they depended on VAULT_URL/link_codes
+exports that aren't committed, breaking the build. Removed from cli.ts
+so main and the v1.0.22 tag build again; the vault/link WIP stays
+unstaged in config.ts and storage.ts for a separate commit later.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com> --force
+    at genericNodeError (node:internal/errors:985:15)
+    at wrappedFn (node:internal/errors:539:14)
+    at checkExecSyncError (node:child_process:925:11)
+    at execFileSync (node:child_process:961:15)
+    at cmSave (file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:78:3)
+    at runHook (file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:329:3)
+    at main (file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:365:7)
+    at file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:380:1
+    at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)
+[2026-10-23T01:19:29.442Z] Error: Command failed: node /Users/aruna/coding-memory/coding-memory/dist/cli.js save coding-memory decision fix: hook chaining silently no-op'd when cm ran through a symlinked bin
+
+main() was gated behind an isMainModule check (added for test safety)
+comparing process.argv[1] against import.meta.url. That check never
+matched when invoked through the global `cm` bin, which is a symlink —
+argv[1] keeps the symlink path as invoked while import.meta.url resolves
+to the real target. main() silently never ran, so cm init did nothing at
+all (not just skipping hook chaining — the chaining logic was never
+reached in the first place). Fixed by resolving argv[1] through
+realpathSync before comparing.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com> --force
+    at genericNodeError (node:internal/errors:985:15)
+    at wrappedFn (node:internal/errors:539:14)
+    at checkExecSyncError (node:child_process:925:11)
+    at execFileSync (node:child_process:961:15)
+    at cmSave (file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:78:3)
+    at runHook (file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:329:3)
+    at main (file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:365:7)
+    at file:///Users/aruna/coding-memory/coding-memory/.coding-memory/post-commit-hook.mjs:380:1
+    at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)

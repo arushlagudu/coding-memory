@@ -55,3 +55,10 @@ export const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON
 //
 // create index memory_links_source_id_idx on memory_links(source_id);
 // create index memory_links_target_id_idx on memory_links(target_id);
+
+// `cm link` (src/cli.ts) writes to a link_codes table, and the vault pairs
+// devices to GitHub accounts via user_devices. The vault owns that schema —
+// run supabase/migrations/001_user_devices_and_link_codes.sql from the
+// stackmem-vault repo. link_codes is RLS-scoped to the same 'x-device-id'
+// header as the policies above, so a device can create and poll only its own
+// codes; the vault reads them with the service-role key.
