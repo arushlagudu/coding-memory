@@ -27,13 +27,113 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config.js";
 import { getDeviceId } from "./device.js";
 
-export const supabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+const rawSupabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   global: {
     headers: {
       "x-device-id": getDeviceId(),
     },
   },
 });
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// maxAttempts counts RETRIES, not total tries — the default (3 retries,
+// 500ms base) produces exactly the 500ms / 1000ms / 2000ms backoff
+// sequence across 4 total tries (1 initial + 3 retries).
+export async function withRetry<T>(
+  fn: () => Promise<T>,
+  maxAttempts = 3,
+  baseDelayMs = 500
+): Promise<T> {
+  let lastError: unknown;
+
+  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt === maxAttempts) break;
+
+      const delayMs = baseDelayMs * 2 ** attempt;
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `Supabase request failed (retry ${attempt + 1}/${maxAttempts} in ${delayMs}ms): ${message}`
+      );
+      await sleep(delayMs);
+    }
+  }
+
+  throw lastError;
+}
+
+// A 4xx response (bad request, not found, RLS denial) is a logic error —
+// retrying it wastes time and can't succeed. status 0 (the fetch itself
+// failed: DNS, connection refused, timeout) and 5xx (transient server
+// errors) are the cases retrying can actually help with.
+function isRetryableStatus(status: number): boolean {
+  return status === 0 || status >= 500;
+}
+
+// Supabase/postgrest query results RESOLVE with { data, error, status }
+// even on failure — they don't reject — so a plain try/catch around the
+// call never sees a 5xx or network failure to retry. This wraps every
+// query builder returned from `.from(...)` so that a retryable result
+// is converted into a throw (for withRetry's catch to see), while a
+// success or a non-retryable 4xx result still resolves normally, exactly
+// as every existing `const { data, error } = await supabase.from(...)...`
+// call site already expects — no call site elsewhere needs to change.
+function wrapWithRetry<T>(target: T): T {
+  if (target === null || typeof target !== "object") return target;
+
+  return new Proxy(target as object, {
+    get(obj: any, prop, receiver) {
+      if (prop === "then") {
+        return (onFulfilled?: unknown, onRejected?: unknown) => {
+          const attempt = () =>
+            new Promise((resolve, reject) => {
+              obj.then(
+                (result: any) => {
+                  if (result && result.error && isRetryableStatus(result.status)) {
+                    const err = new Error(
+                      `Supabase request failed (status ${result.status}): ${result.error.message}`
+                    );
+                    (err as any).status = result.status;
+                    (err as any).supabaseError = result.error;
+                    reject(err);
+                  } else {
+                    resolve(result);
+                  }
+                },
+                (err: unknown) => reject(err)
+              );
+            });
+
+          return withRetry(attempt).then(
+            onFulfilled as ((value: unknown) => unknown) | undefined,
+            onRejected as ((reason: unknown) => unknown) | undefined
+          );
+        };
+      }
+
+      const value = Reflect.get(obj, prop, receiver);
+      if (typeof value === "function") {
+        return (...args: unknown[]) => wrapWithRetry(value.apply(obj, args));
+      }
+      return value;
+    },
+  }) as T;
+}
+
+export const supabase: SupabaseClient = new Proxy(rawSupabase, {
+  get(obj, prop, receiver) {
+    if (prop === "from") {
+      return (...args: unknown[]) => wrapWithRetry((obj.from as (...a: unknown[]) => unknown)(...args));
+    }
+    return Reflect.get(obj, prop, receiver);
+  },
+}) as SupabaseClient;
 
 // Run this migration in the Supabase SQL editor to add the access_count
 // column used by the memory decay scoring in src/scoring.ts (computeDecayScore)

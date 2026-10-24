@@ -2,11 +2,13 @@
 import nodeFs from "node:fs";
 import nodeOs from "node:os";
 import nodePath from "node:path";
+import { execFileSync } from "node:child_process";
 import { randomInt } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { analyzeCodebase } from "./ast-index.js";
 import { VAULT_URL } from "./config.js";
+import { defaultConfigFileContents, readStackmemConfig, STACKMEM_CONFIG_FILENAME } from "./config-file.js";
 import { getDeviceId } from "./device.js";
 import {
   applyContextBudget,
@@ -20,11 +22,25 @@ import {
   indicatesFailedApproach,
   isAuthRelatedFile,
   isCodeFile,
+  hasTokenOverlap,
   isQualityMessage,
   redactSecrets,
   scoreMemoryRelevance,
+  tokenize,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
+
+// Checked as early as ESM import hoisting allows — before any command
+// dispatch, config loading, or network call — so an unsupported Node
+// version fails with a clear message instead of an obscure syntax or
+// API error from deeper in the dependency chain.
+const NODE_MAJOR_VERSION = Number(process.versions.node.split(".")[0]);
+if (NODE_MAJOR_VERSION < 18) {
+  console.error(
+    `Error: stackmem requires Node 18 or higher.\nYou are running Node ${process.versions.node}.\nPlease upgrade: https://nodejs.org`
+  );
+  process.exit(1);
+}
 
 const CONTEXT_BUDGET_TOKENS = 2000;
 const COMPRESSION_THRESHOLD = 20;
@@ -41,7 +57,7 @@ const DIST_INDEX_PATH = nodePath.join(nodePath.dirname(CLI_PATH), "..", "dist", 
 const STACKMEM_HOOK_MARKER = "# stackmem-managed";
 const CLAUDE_MD_MARKER = "the stackmem MCP server will automatically load memories for this project";
 const RULES_FILE_MARKER = "# stackmem — project memory (auto-updated)";
-const HOOK_BACKUP_FILENAME = "post-commit.pre-stackmem";
+const HOOK_BACKUP_SUFFIX = ".pre-stackmem";
 
 const MEMORY_TYPES = ["decision", "rejection", "constraint", "discovery"] as const;
 type MemoryType = (typeof MEMORY_TYPES)[number];
@@ -61,14 +77,17 @@ function usage(): never {
   cm analyze [project] <path>
   cm search [--project <name>] <query>
   cm resolve [project] <memory-id>
+  cm pin [project] <memory-id>
+  cm unpin [project] <memory-id>
   cm delete [project] <memory-id>
   cm inspect [project] <memory-id>
   cm compress [project]
-  cm init <project> <path>
+  cm init <project> <path> [--config]
   cm uninstall [project] [path]
   cm link
   cm sync
   cm context [--project <name>] <task>
+  cm why [--project <name>] <file>
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
   cm doctor [--fix]
   cm undo [project]
@@ -120,6 +139,14 @@ function cmdHelp() {
   cm resolve [project] <memory-id>
       Mark a memory as resolved.
 
+  cm pin [project] <memory-id>
+      Pin a memory: it scores 999 in decay ranking (always sorts
+      first, never decays) and shows in its own "Pinned" section at
+      the top of 'cm start', ahead of its normal type group.
+
+  cm unpin [project] <memory-id>
+      Un-pin a memory, returning it to normal decay-based ranking.
+
   cm delete [project] <memory-id>
       Delete a memory and any memory_links referencing it.
 
@@ -134,7 +161,7 @@ function cmdHelp() {
       Cluster related unresolved memories (needs 20+) and collapse
       clusters of 3 or more into a single summary memory.
 
-  cm init <project> <path>
+  cm init <project> <path> [--config]
       Install a git post-commit hook in the repo at <path>, register
       the stackmem MCP server with Claude Code, write a CLAUDE.md,
       .cursorrules, .windsurfrules, and .stackmem file, and seed
@@ -142,7 +169,12 @@ function cmdHelp() {
       .windsurfrules are pre-filled with the project's current
       memories (for Cursor and Windsurf) and skipped if they already
       exist. The post-commit hook keeps them fresh afterward by
-      running 'cm sync' on every commit.
+      running 'cm sync' on every commit — on disk only, never
+      committed, so they don't double your commit count or conflict
+      across branches. Both files are added to .gitignore. With
+      --config, also writes a default .stackmem.json (ignore patterns,
+      tokenBudget, decayLambda, captureTypes, minQualityScore — see
+      src/config-file.ts) if one doesn't already exist.
 
   cm uninstall [project] [path]
       Remove everything 'cm init' set up at <path> (defaults to the
@@ -166,13 +198,22 @@ function cmdHelp() {
       Regenerate .cursorrules and .windsurfrules from the project's
       current unresolved memories (decay-ranked, capped at a 2000
       token budget) and its 5 most recent open execution_log fixes,
-      overwriting both files. Project is read from .stackmem.
+      overwriting both files on disk only (never git add/commit).
+      Project is read from .stackmem.
 
   cm context [--project <name>] <task>
       Return only the top 5 memories most relevant to a specific
       task, ranked by a blend of task relevance and decay score,
       as a markdown block capped at a 2000 token budget. Use
       --project to target a project other than the one in .stackmem.
+
+  cm why [--project <name>] <file>
+      Show memories tied to a file: matched by Item 6's file_paths
+      column (hook-captured commits that touched it) plus a plain
+      content search for the file's path or basename, ranked by decay
+      score and grouped by type. Prints a guidance message instead if
+      nothing matches. Use --project to target a project other than
+      the one in .stackmem.
 
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
       Capture what happened in a session and extract memories: each
@@ -293,7 +334,84 @@ function splitProjectFromVariadic(args: string[]): { project: string | null; res
   return { project: null, rest: args };
 }
 
+// Generic "--flag value" extractor for internal/provenance flags (not
+// meant to be remembered by end users — only the hook and MCP server pass
+// these). Unlike splitProjectFromVariadic's --project, these don't need
+// special positional disambiguation, so one generic helper covers all of
+// them: --commit-sha, --author, --source, --confidence, --files.
+function extractValueFlag(args: string[], flag: string): { value: string | null; rest: string[] } {
+  const idx = args.indexOf(flag);
+  if (idx === -1 || args[idx + 1] === undefined) return { value: null, rest: args };
+  return { value: args[idx + 1], rest: [...args.slice(0, idx), ...args.slice(idx + 2)] };
+}
+
 // --- cm start ----------------------------------------------------------
+
+const RECENT_COMMITS_FOR_FILE_SIGNAL = 5;
+const BRANCH_NAME_BOOST = 1.2;
+const RECENT_FILES_BOOST = 1.3;
+const PR_TITLE_BOOST = 1.2;
+
+// null means "signal unavailable" (git/gh failed, detached HEAD, not
+// enough history, gh not installed, no open PR, etc.) — every one of
+// these is a soft skip, never an error, per the task spec.
+function getBranchNameTokens(): Set<string> | null {
+  try {
+    const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!branch || branch === "HEAD") return null; // detached HEAD
+    const tokens = tokenize(branch);
+    return tokens.size > 0 ? tokens : null;
+  } catch {
+    return null;
+  }
+}
+
+function getRecentlyTouchedFiles(): Set<string> | null {
+  try {
+    const output = execFileSync(
+      "git",
+      ["diff", "--name-only", `HEAD~${RECENT_COMMITS_FOR_FILE_SIGNAL}`, "HEAD"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }
+    );
+    const files = output.split("\n").map((f) => f.trim()).filter(Boolean);
+    return files.length > 0 ? new Set(files) : null;
+  } catch {
+    // Fewer than RECENT_COMMITS_FOR_FILE_SIGNAL commits in history, or
+    // not a git repo at all — skip gracefully.
+    return null;
+  }
+}
+
+function getOpenPrTitleTokens(): Set<string> | null {
+  try {
+    const title = execFileSync("gh", ["pr", "view", "--json", "title", "-q", ".title"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!title) return null;
+    const tokens = tokenize(title);
+    return tokens.size > 0 ? tokens : null;
+  } catch {
+    // gh not installed, not authenticated, or no open PR for this branch.
+    return null;
+  }
+}
+
+function fileListOverlaps(filePaths: unknown, recentFiles: Set<string>): boolean {
+  if (!Array.isArray(filePaths)) return false;
+  return filePaths.some((candidate) => {
+    if (typeof candidate !== "string") return false;
+    if (recentFiles.has(candidate)) return true;
+    const base = candidate.split("/").pop();
+    for (const recent of recentFiles) {
+      if (recent.split("/").pop() === base) return true;
+    }
+    return false;
+  });
+}
 
 async function cmdStart(project: string) {
   const { data, error } = await supabase
@@ -312,14 +430,42 @@ async function cmdStart(project: string) {
     return;
   }
 
+  // Task-aware re-ranking: boost memories relevant to what's actively
+  // being worked on, multiplicatively on top of the base decay score.
+  // Every signal degrades to null (no boost, not an error) if the
+  // repo/branch/gh state it needs isn't available.
+  const branchTokens = getBranchNameTokens();
+  const recentFiles = getRecentlyTouchedFiles();
+  const prTitleTokens = getOpenPrTitleTokens();
+
+  const config = readStackmemConfig();
+  const tokenBudget = config.tokenBudget;
+
   const scoredMemories = memories
-    .map((memory) => ({
-      ...memory,
-      decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0),
-    }))
+    .map((memory) => {
+      let decayScore = computeDecayScore(
+        new Date(memory.created_at),
+        memory.access_count ?? 0,
+        memory.pinned ?? false,
+        config.decayLambda
+      );
+
+      const contentTokens = tokenize(memory.content);
+      if (branchTokens && hasTokenOverlap(contentTokens, branchTokens)) {
+        decayScore *= BRANCH_NAME_BOOST;
+      }
+      if (recentFiles && fileListOverlaps(memory.file_paths, recentFiles)) {
+        decayScore *= RECENT_FILES_BOOST;
+      }
+      if (prTitleTokens && hasTokenOverlap(contentTokens, prTitleTokens)) {
+        decayScore *= PR_TITLE_BOOST;
+      }
+
+      return { ...memory, decay_score: decayScore };
+    })
     .sort((a, b) => b.decay_score - a.decay_score);
 
-  const budgetedMemories = applyContextBudget(scoredMemories, CONTEXT_BUDGET_TOKENS);
+  const budgetedMemories = applyContextBudget(scoredMemories, tokenBudget);
   const omittedCount = scoredMemories.length - budgetedMemories.length;
   let tokensUsed = budgetedMemories.reduce(
     (sum, memory) => sum + estimateTokens(memory.content),
@@ -336,12 +482,12 @@ async function cmdStart(project: string) {
 
   if (fixError) fail(`Failed to load execution log: ${fixError.message}`);
 
-  // Fixes share the same 2000-token budget as memories, which already
-  // consumed their portion above — fixes only get whatever room is left.
+  // Fixes share the same token budget as memories, which already consumed
+  // their portion above — fixes only get whatever room is left.
   const budgetedFixes: { problem: string; solution: string | null }[] = [];
   for (const fix of fixData ?? []) {
     const tokens = estimateTokens(`${fix.problem} ${fix.solution ?? ""}`);
-    if (tokensUsed + tokens > CONTEXT_BUDGET_TOKENS) break;
+    if (tokensUsed + tokens > tokenBudget) break;
     budgetedFixes.push(fix);
     tokensUsed += tokens;
   }
@@ -366,8 +512,24 @@ async function cmdStart(project: string) {
 
   console.log(`Loaded ${scoredMemories.length} memory(ies) for "${project}".\n`);
 
+  const pinnedMemories = budgetedMemories.filter((m) => m.pinned);
+  const unpinnedMemories = budgetedMemories.filter((m) => !m.pinned);
+
+  if (pinnedMemories.length > 0) {
+    console.log(`Pinned (${pinnedMemories.length})`);
+    console.log("-".repeat(11));
+    for (const memory of pinnedMemories) {
+      console.log(`  [${memory.id}] (${memory.type}) ${memory.content}`);
+      const linked = Array.from(linkedIdsByMemory.get(memory.id) ?? []);
+      if (linked.length > 0) {
+        console.log(`      linked: ${linked.join(", ")}`);
+      }
+    }
+    console.log("");
+  }
+
   for (const type of MEMORY_TYPES) {
-    const group = budgetedMemories.filter((m) => m.type === type);
+    const group = unpinnedMemories.filter((m) => m.type === type);
     if (group.length === 0) continue;
 
     console.log(`${TYPE_LABELS[type]} (${group.length})`);
@@ -392,7 +554,7 @@ async function cmdStart(project: string) {
     }
   }
 
-  console.log(`Context budget: ${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used`);
+  console.log(`Context budget: ${tokensUsed}/${tokenBudget} tokens used`);
   if (omittedCount > 0) {
     console.log(`${omittedCount} memories omitted (budget exceeded)`);
   }
@@ -446,7 +608,26 @@ async function confirmSupersede(oldId: string, newContent: string): Promise<bool
   return false;
 }
 
-async function cmdSave(project: string, type: string, content: string, force = false) {
+// Provenance metadata attached to a memory at save time. Manual `cm save`
+// calls (a human at the keyboard) leave this at its defaults — source
+// "manual", confidence 1.0, no commit/file/author info. The hook passes
+// commitSha/filePaths/author and source "hook" with a lower confidence;
+// MCP tool saves pass source "mcp".
+interface SaveProvenance {
+  commitSha?: string;
+  filePaths?: string[];
+  author?: string;
+  source?: "hook" | "manual" | "mcp";
+  confidence?: number;
+}
+
+async function cmdSave(
+  project: string,
+  type: string,
+  content: string,
+  force = false,
+  provenance: SaveProvenance = {}
+) {
   if (!MEMORY_TYPES.includes(type as MemoryType)) {
     fail(`Invalid memory type '${type}'. Valid types: decision, constraint, discovery, rejection.`);
   }
@@ -492,9 +673,22 @@ async function cmdSave(project: string, type: string, content: string, force = f
     if (resolveError) fail(`Failed to resolve superseded memory: ${resolveError.message}`);
   }
 
+  const { commitSha, filePaths, author, source = "manual", confidence = 1.0 } = provenance;
+  const insertPayload: Record<string, unknown> = {
+    project,
+    type,
+    content,
+    device_id: getDeviceId(),
+    source,
+    confidence,
+  };
+  if (commitSha) insertPayload.commit_sha = commitSha;
+  if (filePaths && filePaths.length > 0) insertPayload.file_paths = filePaths;
+  if (author) insertPayload.author = author;
+
   const { data: inserted, error } = await supabase
     .from("memories")
-    .insert({ project, type, content, device_id: getDeviceId() })
+    .insert(insertPayload)
     .select("id")
     .single();
 
@@ -528,6 +722,40 @@ async function cmdSave(project: string, type: string, content: string, force = f
   if ((unresolvedCount ?? 0) >= COMPRESSION_THRESHOLD) {
     await compressMemories(project);
   }
+}
+
+// --- cm check-commit (internal, used by the hook) --------------------------
+
+// Not a user-facing command (no usage()/help entry) — the hook calls this
+// once per invocation, before doing any diff analysis, to decide whether
+// this commit_sha has already been captured. post-commit and post-rewrite
+// both run the exact same capture logic against current HEAD, so without
+// this guard, a commit that fires both hooks (e.g. `git commit --amend`,
+// which triggers post-commit for the new commit AND post-rewrite for the
+// rewrite) would be captured twice. Checked once per invocation — not
+// inside each individual cmSave call — because a single commit normally
+// produces several distinct memories; a per-save check would see the
+// first save's own commit_sha and wrongly skip the rest.
+async function cmdCheckCommit(project: string, commitSha: string): Promise<void> {
+  const { data, error } = await supabase
+    .from("memories")
+    .select("id")
+    .eq("project", project)
+    .eq("commit_sha", commitSha)
+    .limit(1);
+
+  if (error) {
+    // Fail open: an error here (including "column does not exist" if the
+    // commit_sha migration hasn't landed yet) must not look identical to
+    // "duplicate, skip" below — that would silently suppress every hook
+    // capture with no log trail. Exit 0 so the normal save path runs;
+    // if commit_sha genuinely isn't a column, the save itself fails
+    // there instead, where the hook's outer error handler logs it.
+    console.error(`check-commit: ${error.message}`);
+    process.exit(0);
+  }
+
+  process.exit(data && data.length > 0 ? 1 : 0);
 }
 
 // --- memory compression ----------------------------------------------------
@@ -688,6 +916,34 @@ async function cmdResolve(project: string, memoryId: string) {
   console.log(`Resolved memory [${memoryId}]`);
 }
 
+// --- cm pin / cm unpin -------------------------------------------------
+
+async function setPinned(project: string, memoryId: string, pinned: boolean): Promise<void> {
+  const { data, error } = await supabase
+    .from("memories")
+    .update({ pinned })
+    .eq("project", project)
+    .eq("id", memoryId)
+    .select("id");
+
+  if (error) fail(`Failed to ${pinned ? "pin" : "unpin"} memory: ${error.message}`);
+
+  if (!data || data.length === 0) {
+    console.log(`No memory found with ID [${memoryId}]`);
+    return;
+  }
+
+  console.log(`${pinned ? "Pinned" : "Unpinned"} memory [${memoryId}]`);
+}
+
+async function cmdPin(project: string, memoryId: string): Promise<void> {
+  await setPinned(project, memoryId, true);
+}
+
+async function cmdUnpin(project: string, memoryId: string): Promise<void> {
+  await setPinned(project, memoryId, false);
+}
+
 // --- cm delete -------------------------------------------------------------
 
 async function cmdDelete(project: string, memoryId: string) {
@@ -735,7 +991,13 @@ async function cmdInspect(project: string, memoryId: string) {
 
   if (error || !memory) fail(`Memory [${memoryId}] not found for "${project}".`);
 
-  const decayScore = computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0);
+  const config = readStackmemConfig();
+  const decayScore = computeDecayScore(
+    new Date(memory.created_at),
+    memory.access_count ?? 0,
+    memory.pinned ?? false,
+    config.decayLambda
+  );
 
   const { data: links, error: linksError } = await supabase
     .from("memory_links")
@@ -843,6 +1105,65 @@ try {
 
 const CLI_PATH = ${JSON.stringify(cliPath)};
 
+// Inlined copy of src/config-file.ts's defaults/merge logic — this script
+// runs standalone with no import access to that module.
+const DEFAULT_STACKMEM_CONFIG = {
+  ignore: [],
+  tokenBudget: 2000,
+  decayLambda: 0.05,
+  captureTypes: ["decision", "constraint", "discovery", "rejection"],
+  minQualityScore: 0.3,
+};
+
+function isStringArray(value) {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+function readStackmemConfig() {
+  const configPath = join(process.cwd(), ".stackmem.json");
+  try {
+    const raw = JSON.parse(readFileSync(configPath, "utf8"));
+    return {
+      ignore: isStringArray(raw.ignore) ? raw.ignore : DEFAULT_STACKMEM_CONFIG.ignore,
+      tokenBudget:
+        typeof raw.tokenBudget === "number" && raw.tokenBudget > 0
+          ? raw.tokenBudget
+          : DEFAULT_STACKMEM_CONFIG.tokenBudget,
+      decayLambda:
+        typeof raw.decayLambda === "number" && raw.decayLambda > 0
+          ? raw.decayLambda
+          : DEFAULT_STACKMEM_CONFIG.decayLambda,
+      captureTypes: isStringArray(raw.captureTypes) ? raw.captureTypes : DEFAULT_STACKMEM_CONFIG.captureTypes,
+      minQualityScore:
+        typeof raw.minQualityScore === "number"
+          ? raw.minQualityScore
+          : DEFAULT_STACKMEM_CONFIG.minQualityScore,
+    };
+  } catch {
+    return { ...DEFAULT_STACKMEM_CONFIG };
+  }
+}
+
+function matchesIgnorePattern(filePath, pattern) {
+  const base = filePath.split("/").pop() ?? filePath;
+
+  if (pattern.endsWith("/")) {
+    const dirName = pattern.slice(0, -1);
+    return filePath.split("/").includes(dirName);
+  }
+
+  if (pattern.includes("*")) {
+    const regex = new RegExp(
+      "^" + pattern.split("*").map((part) => part.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&")).join(".*") + "$"
+    );
+    return regex.test(base) || regex.test(filePath);
+  }
+
+  return filePath === pattern || base === pattern;
+}
+
+const STACKMEM_CONFIG = readStackmemConfig();
+
 const SECRET_PATTERNS = [
   /AKIA[0-9A-Z]{16}/g,
   /(api[_-]?key|apikey)\\s*[:=]\\s*["']?[\\w-]{20,}["']?/gi,
@@ -899,10 +1220,43 @@ function git(args) {
   return execFileSync("git", args, { encoding: "utf-8" }).trim();
 }
 
+const CURRENT_SHA = git(["rev-parse", "HEAD"]);
+const CURRENT_AUTHOR = (() => {
+  try {
+    return git(["log", "--format=%ae", "-1", "HEAD"]);
+  } catch {
+    return "";
+  }
+})();
+
+// post-commit and post-rewrite both run this exact script against current
+// HEAD, so a single operation that fires both (e.g. \`git commit --amend\`)
+// would otherwise capture the same commit twice. Checked once up front,
+// not per-save — see cmdCheckCommit in src/cli.ts for why.
+try {
+  execFileSync("node", [CLI_PATH, "check-commit", PROJECT, CURRENT_SHA], { stdio: "pipe" });
+} catch {
+  return;
+}
+
+// file_paths is populated with every file the commit touched (not just
+// the filtered diffableFiles below) — "cm why <file>" should still find
+// a commit's decision/discovery even if that specific file's own diff
+// content was skipped as noise (a lockfile, say).
 function cmSave(type, content) {
-  execFileSync("node", [CLI_PATH, "save", PROJECT, type, content, "--force"], {
-    stdio: "inherit",
-  });
+  if (!STACKMEM_CONFIG.captureTypes.includes(type)) return;
+
+  const args = [
+    CLI_PATH, "save", PROJECT, type, content, "--force",
+    "--commit-sha", CURRENT_SHA,
+    "--source", "hook",
+    "--confidence", "0.8",
+  ];
+  if (CURRENT_AUTHOR) args.push("--author", CURRENT_AUTHOR);
+  if (changedFiles.length > 0) args.push("--files", changedFiles.join(","));
+
+  execFileSync("node", args, { stdio: "inherit" });
+  savedItems.push(\`\${type}: \${content}\`);
 }
 
 function basename(filePath) {
@@ -927,6 +1281,29 @@ function isSchemaFile(filePath) {
     filePath.includes("schema.prisma") ||
     filePath.includes("schema.sql")
   );
+}
+
+// Noise that's never worth diffing: lockfiles, build output, vendored/
+// generated code, and timestamp-prefixed SQL migrations (their content is
+// a mechanical dump, not a human decision). Checked against path segments
+// (not just a prefix) so "apps/web/dist/bundle.js" is skipped too, not
+// just a top-level "dist/...".
+const DIFF_SKIP_DIR_NAMES = new Set(["dist", "build", ".next", "coverage", "vendored", "node_modules"]);
+const DIFF_SKIP_LOCK_NAMES = new Set(["package-lock.json", "yarn.lock", "pnpm-lock.yaml"]);
+const MIGRATION_FILE_RE = /^\\d{14}_.*\\.sql$/;
+const DIFF_MAX_BYTES = 50 * 1024;
+
+function shouldSkipDiffFile(filePath) {
+  const base = basename(filePath);
+  if (filePath.split("/").some((segment) => DIFF_SKIP_DIR_NAMES.has(segment))) return true;
+  if (DIFF_SKIP_LOCK_NAMES.has(base) || base.endsWith(".lock")) return true;
+  if (base.endsWith(".min.js") || base.endsWith(".min.css")) return true;
+  if (base.endsWith(".map")) return true;
+  if (base.endsWith(".pb.go")) return true;
+  if (/\\.generated\\./.test(base)) return true;
+  if (MIGRATION_FILE_RE.test(base)) return true;
+  if (STACKMEM_CONFIG.ignore.some((pattern) => matchesIgnorePattern(filePath, pattern))) return true;
+  return false;
 }
 
 const LOW_QUALITY_PREFIXES = [
@@ -963,11 +1340,10 @@ const savedItems = [];
 
 const commitMessage = git(["log", "-1", "--pretty=%B"]);
 
-// The sync commit below is itself a commit, so it fires this same
-// post-commit hook again — git's --no-verify only skips pre-commit and
-// commit-msg hooks, never post-commit. Without this guard, the hook would
-// save its own commit message as a new decision memory, which changes the
-// rules-file content and triggers another sync commit, indefinitely.
+// Kept as a general escape hatch for other automation (CI bots, scripts)
+// that tags its own commits this way and shouldn't be captured as a
+// memory — cm sync no longer self-commits, so this isn't load-bearing for
+// that anymore, but other tools' commits still deserve the same skip.
 if (commitMessage.includes("[skip ci]")) {
   return;
 }
@@ -991,10 +1367,40 @@ const changedFiles = git(
 
 let diff = "";
 if (!isFirstCommit) {
+  // --numstat marks a binary file's added/deleted columns as "-" — that's
+  // the cheapest way to identify them without fetching their (useless,
+  // and potentially huge) diff content at all.
+  let binaryFiles = new Set();
   try {
-    diff = execFileSync("git", ["diff", "HEAD~1", "HEAD"], { encoding: "utf-8" });
+    const numstat = execFileSync("git", ["diff", "--numstat", "HEAD~1", "HEAD"], {
+      encoding: "utf-8",
+    });
+    for (const line of numstat.split("\\n")) {
+      const parts = line.split("\\t");
+      if (parts[0] === "-" && parts[1] === "-" && parts[2]) {
+        binaryFiles.add(parts[2]);
+      }
+    }
   } catch {
-    diff = "";
+    // Nothing to compare against — leave binaryFiles empty.
+  }
+
+  const diffableFiles = changedFiles.filter(
+    (file) => !binaryFiles.has(file) && !shouldSkipDiffFile(file)
+  );
+
+  if (diffableFiles.length > 0) {
+    try {
+      diff = execFileSync("git", ["diff", "HEAD~1", "HEAD", "--", ...diffableFiles], {
+        encoding: "utf-8",
+      });
+    } catch {
+      diff = "";
+    }
+  }
+
+  if (diff.length > DIFF_MAX_BYTES) {
+    diff = diff.slice(0, DIFF_MAX_BYTES) + "\\n\\n... [diff truncated: exceeded 50KB after filtering]\\n";
   }
 }
 
@@ -1021,17 +1427,14 @@ for (const line of isFirstCommit ? [] : lines) {
       if (/(auth|login|session|token)/i.test(currentFile)) {
         const content = redactSecrets(\`new auth-related file: \${currentFile}\`);
         cmSave("discovery", content);
-        savedItems.push(\`discovery: \${content}\`);
       }
       if (isConfigFile(currentFile)) {
         const content = redactSecrets(\`new config: \${currentFile}\`);
         cmSave("constraint", content);
-        savedItems.push(\`constraint: \${content}\`);
       }
       if (isSchemaFile(currentFile)) {
         const content = redactSecrets(\`schema change: \${currentFile}\`);
         cmSave("discovery", content);
-        savedItems.push(\`discovery: \${content}\`);
       }
     }
     continue;
@@ -1068,7 +1471,6 @@ for (const line of isFirstCommit ? [] : lines) {
     if (removedModulePath) {
       const content = redactSecrets(\`removed dependency: \${removedModulePath}\`);
       cmSave("rejection", content);
-      savedItems.push(\`rejection: \${content}\`);
     }
 
     if (isPackageJson && inDependenciesSection) {
@@ -1076,7 +1478,6 @@ for (const line of isFirstCommit ? [] : lines) {
       if (pkgMatch && pkgMatch[1] !== "dependencies" && pkgMatch[1] !== "devDependencies") {
         const content = redactSecrets(\`removed dependency: \${pkgMatch[1]}\`);
         cmSave("rejection", content);
-        savedItems.push(\`rejection: \${content}\`);
       }
     }
     continue;
@@ -1092,7 +1493,6 @@ for (const line of isFirstCommit ? [] : lines) {
         if (envMatch) {
           const content = redactSecrets(\`new env var required: \${envMatch[1]}\`);
           cmSave("constraint", content);
-          savedItems.push(\`constraint: \${content}\`);
         }
       }
     }
@@ -1102,7 +1502,6 @@ for (const line of isFirstCommit ? [] : lines) {
       if (pkgMatch && pkgMatch[1] !== "dependencies" && pkgMatch[1] !== "devDependencies") {
         const content = redactSecrets(\`added dependency: \${pkgMatch[1]}\`);
         cmSave("decision", content);
-        savedItems.push(\`decision: \${content}\`);
       }
     }
 
@@ -1110,14 +1509,12 @@ for (const line of isFirstCommit ? [] : lines) {
       const truncated = codeLine.trim().slice(0, 80);
       const content = redactSecrets(\`database change: \${truncated}\`);
       cmSave("discovery", content);
-      savedItems.push(\`discovery: \${content}\`);
     }
 
     if (/^\\+\\s*(\\/\\/|#)\\s*(TODO:|FIXME:|HACK:|XXX:)/.test(line)) {
       const truncated = codeLine.trim().slice(0, 100);
       const content = redactSecrets(\`open issue from commit: \${truncated}\`);
       cmSave("discovery", content);
-      savedItems.push(\`discovery: \${content}\`);
     }
   }
 }
@@ -1146,19 +1543,16 @@ if (breakingMatch) {
   const breakingContent = redactSecrets(breakingMatch[1].trim());
   const content = \`BREAKING CHANGE: \${breakingContent}\`;
   cmSave("constraint", content);
-  savedItems.push(\`constraint: \${content}\`);
 }
 
 if (conventionalType && CONVENTIONAL_DECISION_TYPES.has(conventionalType)) {
   const trimmedMessage = redactSecrets(trimmedCommitMessage);
   cmSave("decision", trimmedMessage);
-  savedItems.push(\`decision: \${trimmedMessage}\`);
 } else if (conventionalType && CONVENTIONAL_SKIP_TYPES.has(conventionalType)) {
   // docs/style/test/ci/build/chore — skip entirely, nothing saved.
 } else if (isQualityCommitMessage(commitMessage)) {
   const trimmedMessage = redactSecrets(trimmedCommitMessage);
   cmSave("decision", trimmedMessage);
-  savedItems.push(\`decision: \${trimmedMessage}\`);
 }
 
 console.log(\`coding-memory post-commit summary (\${changedFiles.length} file(s) changed):\`);
@@ -1166,21 +1560,13 @@ for (const item of savedItems) {
   console.log(\`  - \${item}\`);
 }
 
+// Updates .cursorrules/.windsurfrules on disk only — no git add/commit.
+// Editors read these files straight off disk, and they're gitignored by
+// default (see DEFAULT_GITIGNORE_CONTENT), so there's nothing to keep in
+// sync with git history; committing them here used to double the commit
+// count on every real commit and produced constant rules-file merge
+// conflicts on teams.
 execFileSync("node", [CLI_PATH, "sync"], { stdio: "inherit" });
-
-// cm sync rewrites .cursorrules/.windsurfrules, which would otherwise leave
-// the working directory dirty (breaking things like \`npm version patch\`
-// that require a clean tree). Commit the sync ourselves instead. --no-verify
-// skips pre-commit/commit-msg hooks (not post-commit — see the [skip ci]
-// guard above, which is what actually stops this from recursing).
-try {
-  execFileSync("git", ["add", ".cursorrules", ".windsurfrules"], { stdio: "pipe" });
-  execFileSync("git", ["commit", "--no-verify", "-m", "chore: sync memory to rules files [skip ci]"], {
-    stdio: "pipe",
-  });
-} catch {
-  // Nothing to commit (rules files unchanged) — fine, ignore.
-}
 }
 
 async function main() {
@@ -1206,15 +1592,27 @@ main().finally(() => process.exit(0));
 `;
 }
 
-// Installs (or re-installs) the stackmem post-commit hook at `hooksDir`. If
-// a post-commit hook already exists and wasn't written by stackmem, it's
+// Hooks stackmem manages. post-rewrite fires on `git commit --amend` and
+// `git rebase` (neither of which is a plain commit, so post-commit alone
+// misses them) — it runs the exact same capture script as post-commit,
+// against current HEAD, with the check-commit idempotency guard in the
+// script itself preventing a double-capture when a single operation
+// (e.g. --amend) fires both hooks for the same resulting commit.
+const MANAGED_HOOK_NAMES = ["post-commit", "post-rewrite"] as const;
+
+function hookBackupFilename(hookName: string): string {
+  return `${hookName}${HOOK_BACKUP_SUFFIX}`;
+}
+
+// Installs (or re-installs) a stackmem-managed hook at `hooksDir`. If a
+// hook of this name already exists and wasn't written by stackmem, it's
 // preserved as a backup and chained to run before stackmem's own hook,
 // rather than being clobbered — see `uninstallHook` for how it's restored.
-function installHook(hooksDir: string, hookLogicPath: string): void {
+function installHook(hooksDir: string, hookLogicPath: string, hookName: string): void {
   nodeFs.mkdirSync(hooksDir, { recursive: true });
 
-  const hookPath = nodePath.join(hooksDir, "post-commit");
-  const backupPath = nodePath.join(hooksDir, HOOK_BACKUP_FILENAME);
+  const hookPath = nodePath.join(hooksDir, hookName);
+  const backupPath = nodePath.join(hooksDir, hookBackupFilename(hookName));
 
   let chainedOriginal = false;
   if (nodeFs.existsSync(hookPath)) {
@@ -1231,7 +1629,7 @@ function installHook(hooksDir: string, hookLogicPath: string): void {
   }
 
   const chainLine = chainedOriginal
-    ? `"$(dirname "$0")/${HOOK_BACKUP_FILENAME}" "$@"\n`
+    ? `"$(dirname "$0")/${hookBackupFilename(hookName)}" "$@"\n`
     : "";
 
   nodeFs.writeFileSync(
@@ -1242,7 +1640,7 @@ function installHook(hooksDir: string, hookLogicPath: string): void {
   nodeFs.chmodSync(hookPath, 0o755);
 
   if (chainedOriginal) {
-    console.log("Existing post-commit hook found — chained it to run before stackmem's hook.");
+    console.log(`Existing ${hookName} hook found — chained it to run before stackmem's hook.`);
   }
 }
 
@@ -1250,9 +1648,9 @@ function installHook(hooksDir: string, hookLogicPath: string): void {
 // stackmem chained it after an existing hook, restores that original hook
 // in its place. Returns a description of what happened, or null if there
 // was no stackmem-managed hook to remove (nothing done).
-function uninstallHook(hooksDir: string): string | null {
-  const hookPath = nodePath.join(hooksDir, "post-commit");
-  const backupPath = nodePath.join(hooksDir, HOOK_BACKUP_FILENAME);
+function uninstallHook(hooksDir: string, hookName: string): string | null {
+  const hookPath = nodePath.join(hooksDir, hookName);
+  const backupPath = nodePath.join(hooksDir, hookBackupFilename(hookName));
 
   if (!nodeFs.existsSync(hookPath)) return null;
 
@@ -1261,11 +1659,11 @@ function uninstallHook(hooksDir: string): string | null {
 
   if (nodeFs.existsSync(backupPath)) {
     nodeFs.renameSync(backupPath, hookPath);
-    return ".git/hooks/post-commit (restored original hook stackmem had chained)";
+    return `.git/hooks/${hookName} (restored original hook stackmem had chained)`;
   }
 
   nodeFs.unlinkSync(hookPath);
-  return ".git/hooks/post-commit";
+  return `.git/hooks/${hookName}`;
 }
 
 // Overridable so tests (and `cm uninstall`'s own smoke-testing) can point
@@ -1328,6 +1726,8 @@ dist/
 coverage/
 *-memories.json
 *.db
+*cursorrules
+*windsurfrules
 `;
 
 // Returns true if the file was created, false if it already existed
@@ -1385,10 +1785,16 @@ async function generateRulesContent(project: string): Promise<string> {
 
   if (memoriesError) fail(`Failed to load memories: ${memoriesError.message}`);
 
+  const config = readStackmemConfig();
   const scoredMemories = (memoryRows ?? [])
     .map((memory) => ({
       ...memory,
-      decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0),
+      decay_score: computeDecayScore(
+        new Date(memory.created_at),
+        memory.access_count ?? 0,
+        memory.pinned ?? false,
+        config.decayLambda
+      ),
     }))
     .sort((a, b) => b.decay_score - a.decay_score);
 
@@ -1507,6 +1913,10 @@ export async function trySeedMemory(
     type,
     content,
     device_id: getDeviceId(),
+    // Seeded by `cm init` scanning project files — an explicit user-run
+    // command, not an auto-captured commit, so it's "manual" like cm save,
+    // not the memories.source column's default of "hook".
+    source: "manual",
   });
   return !error;
 }
@@ -1621,7 +2031,20 @@ async function verifyBackendConnection(project: string): Promise<boolean> {
   return !error;
 }
 
-async function cmdInit(project: string, targetPath: string) {
+// Returns true if the file was created, false if it already existed
+// (and was left untouched).
+function writeStackmemConfigFile(resolvedPath: string): boolean {
+  const configPath = nodePath.join(resolvedPath, STACKMEM_CONFIG_FILENAME);
+
+  if (nodeFs.existsSync(configPath)) {
+    return false;
+  }
+
+  nodeFs.writeFileSync(configPath, defaultConfigFileContents(), "utf-8");
+  return true;
+}
+
+async function cmdInit(project: string, targetPath: string, writeConfig = false): Promise<void> {
   const resolvedPath = nodePath.resolve(targetPath);
   const gitDir = nodePath.join(resolvedPath, ".git");
 
@@ -1641,7 +2064,9 @@ async function cmdInit(project: string, targetPath: string) {
   const hooksDir = nodePath.join(gitDir, "hooks");
   nodeFs.mkdirSync(hooksDir, { recursive: true });
 
-  installHook(hooksDir, hookLogicPath);
+  for (const hookName of MANAGED_HOOK_NAMES) {
+    installHook(hooksDir, hookLogicPath, hookName);
+  }
 
   console.log(`coding-memory hook installed for project ${project} at ${targetPath}`);
 
@@ -1657,9 +2082,14 @@ async function cmdInit(project: string, targetPath: string) {
 
   const backendOk = await verifyBackendConnection(project);
 
+  const configFileWritten = writeConfig ? writeStackmemConfigFile(resolvedPath) : false;
+
   console.log("");
   if (gitignoreCreated) {
     console.log("✓ .gitignore created");
+  }
+  if (writeConfig) {
+    console.log(`✓ .stackmem.json ${configFileWritten ? "written" : "already exists"}`);
   }
   console.log("✓ Git hook installed");
   console.log("✓ MCP server registered");
@@ -1801,9 +2231,17 @@ async function cmdContext(project: string, task: string) {
     return;
   }
 
+  const config = readStackmemConfig();
+  const tokenBudget = config.tokenBudget;
+
   const scoredMemories = memories
     .map((memory) => {
-      const decayScore = computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0);
+      const decayScore = computeDecayScore(
+        new Date(memory.created_at),
+        memory.access_count ?? 0,
+        memory.pinned ?? false,
+        config.decayLambda
+      );
       const relevanceScore = scoreMemoryRelevance(memory.content, task);
       return {
         ...memory,
@@ -1813,7 +2251,7 @@ async function cmdContext(project: string, task: string) {
     .sort((a, b) => b.combined_score - a.combined_score);
 
   const topMemories = scoredMemories.slice(0, CONTEXT_TOP_N);
-  const budgetedMemories = applyContextBudget(topMemories, CONTEXT_BUDGET_TOKENS);
+  const budgetedMemories = applyContextBudget(topMemories, tokenBudget);
   const tokensUsed = budgetedMemories.reduce(
     (sum, memory) => sum + estimateTokens(memory.content),
     0
@@ -1832,9 +2270,80 @@ async function cmdContext(project: string, task: string) {
     lines.push("");
   }
 
-  lines.push(`*(${tokensUsed}/${CONTEXT_BUDGET_TOKENS} tokens used)*`);
+  lines.push(`*(${tokensUsed}/${tokenBudget} tokens used)*`);
 
   console.log(lines.join("\n"));
+}
+
+// --- cm why --------------------------------------------------------------
+
+function fileMatchesPaths(filePaths: unknown, file: string, baseName: string): boolean {
+  if (!Array.isArray(filePaths)) return false;
+  return filePaths.some((p) => typeof p === "string" && (p === file || p.split("/").pop() === baseName));
+}
+
+function fileMentionedInContent(content: string, file: string, baseName: string): boolean {
+  const lower = content.toLowerCase();
+  return lower.includes(file.toLowerCase()) || lower.includes(baseName.toLowerCase());
+}
+
+async function cmdWhy(project: string, file: string) {
+  const baseName = file.split("/").pop() ?? file;
+
+  const { data, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false);
+
+  if (error) fail(`Failed to load memories: ${error.message}`);
+
+  const memories = data ?? [];
+
+  // file_paths (structured, from Item 6) and a content substring search
+  // are combined into one match set rather than one gating the other as
+  // a strict fallback — most memories predate file_paths existing at all
+  // (manual saves and seeds never set it), so content search is the
+  // primary signal for everything except recent hook-captured commits,
+  // not a rare last resort.
+  const matched = memories.filter(
+    (memory) =>
+      fileMatchesPaths(memory.file_paths, file, baseName) ||
+      fileMentionedInContent(memory.content, file, baseName)
+  );
+
+  if (matched.length === 0) {
+    console.log(`No memories found for ${file}.`);
+    console.log("Make some commits touching this file to build up context.");
+    return;
+  }
+
+  const config = readStackmemConfig();
+  const scoredMemories = matched
+    .map((memory) => ({
+      ...memory,
+      decay_score: computeDecayScore(
+        new Date(memory.created_at),
+        memory.access_count ?? 0,
+        memory.pinned ?? false,
+        config.decayLambda
+      ),
+    }))
+    .sort((a, b) => b.decay_score - a.decay_score);
+
+  console.log(`Decisions and constraints tied to ${file}:\n`);
+
+  for (const type of MEMORY_TYPES) {
+    const group = scoredMemories.filter((memory) => memory.type === type);
+    if (group.length === 0) continue;
+
+    console.log(`${TYPE_LABELS[type]} (${group.length})`);
+    console.log("-".repeat(TYPE_LABELS[type].length + 4));
+    for (const memory of group) {
+      console.log(`  [${memory.id}] (score: ${memory.decay_score.toFixed(2)}) ${memory.content}`);
+    }
+    console.log("");
+  }
 }
 
 // --- cm session-end --------------------------------------------------------
@@ -2087,7 +2596,9 @@ async function cmdDoctor(fix: boolean) {
         nodeFs.mkdirSync(codingMemoryDir, { recursive: true });
         const hookLogicPath = nodePath.join(codingMemoryDir, "post-commit-hook.mjs");
         nodeFs.writeFileSync(hookLogicPath, buildHookLogicScript(DIST_CLI_PATH), "utf-8");
-        installHook(hooksDir, hookLogicPath);
+        for (const name of MANAGED_HOOK_NAMES) {
+          installHook(hooksDir, hookLogicPath, name);
+        }
 
         if (isHookExecutable(hookPath)) {
           console.log("Fixed: git hook");
@@ -2284,8 +2795,10 @@ async function cmdUninstall(project: string, targetPath: string) {
   const gitDir = nodePath.join(targetPath, ".git");
   const hooksDir = nodePath.join(gitDir, "hooks");
 
-  const hookResult = uninstallHook(hooksDir);
-  if (hookResult) console.log(`Removed ${hookResult}`);
+  for (const hookName of MANAGED_HOOK_NAMES) {
+    const hookResult = uninstallHook(hooksDir, hookName);
+    if (hookResult) console.log(`Removed ${hookResult}`);
+  }
 
   const codingMemoryDir = nodePath.join(targetPath, ".coding-memory");
 
@@ -2339,9 +2852,20 @@ async function main() {
     case "save": {
       const forceIndex = args.indexOf("--force");
       const force = forceIndex !== -1;
-      const positional = force
+      let positional = force
         ? [...args.slice(0, forceIndex), ...args.slice(forceIndex + 1)]
         : args;
+
+      const commitShaFlag = extractValueFlag(positional, "--commit-sha");
+      positional = commitShaFlag.rest;
+      const authorFlag = extractValueFlag(positional, "--author");
+      positional = authorFlag.rest;
+      const sourceFlag = extractValueFlag(positional, "--source");
+      positional = sourceFlag.rest;
+      const confidenceFlag = extractValueFlag(positional, "--confidence");
+      positional = confidenceFlag.rest;
+      const filesFlag = extractValueFlag(positional, "--files");
+      positional = filesFlag.rest;
 
       let explicitProject: string | null;
       let type: string | undefined;
@@ -2367,7 +2891,28 @@ async function main() {
 
       if (!type || rest.length === 0) usage();
       const project = requireProject(explicitProject);
-      await cmdSave(project, type, rest.join(" "), force);
+
+      const provenance: SaveProvenance = {};
+      if (commitShaFlag.value) provenance.commitSha = commitShaFlag.value;
+      if (authorFlag.value) provenance.author = authorFlag.value;
+      if (sourceFlag.value === "hook" || sourceFlag.value === "manual" || sourceFlag.value === "mcp") {
+        provenance.source = sourceFlag.value;
+      }
+      if (confidenceFlag.value) {
+        const parsed = Number(confidenceFlag.value);
+        if (!Number.isNaN(parsed)) provenance.confidence = parsed;
+      }
+      if (filesFlag.value) {
+        provenance.filePaths = filesFlag.value.split(",").map((f) => f.trim()).filter(Boolean);
+      }
+
+      await cmdSave(project, type, rest.join(" "), force, provenance);
+      break;
+    }
+    case "check-commit": {
+      const [project, commitSha] = args;
+      if (!project || !commitSha) usage();
+      await cmdCheckCommit(project, commitSha);
       break;
     }
     case "fix": {
@@ -2401,6 +2946,22 @@ async function main() {
       await cmdResolve(project, memoryId);
       break;
     }
+    case "pin": {
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [memoryId] = split.rest;
+      await cmdPin(project, memoryId);
+      break;
+    }
+    case "unpin": {
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [memoryId] = split.rest;
+      await cmdUnpin(project, memoryId);
+      break;
+    }
     case "delete": {
       const split = splitOptionalProject(args, 1);
       if (!split) usage();
@@ -2425,9 +2986,15 @@ async function main() {
       break;
     }
     case "init": {
-      const [project, targetPath] = args;
+      const configIndex = args.indexOf("--config");
+      const writeConfig = configIndex !== -1;
+      const positional = writeConfig
+        ? [...args.slice(0, configIndex), ...args.slice(configIndex + 1)]
+        : args;
+
+      const [project, targetPath] = positional;
       if (!project || !targetPath) usage();
-      await cmdInit(project, targetPath);
+      await cmdInit(project, targetPath, writeConfig);
       break;
     }
     case "link": {
@@ -2446,6 +3013,13 @@ async function main() {
       const project = requireProject(split.project);
       if (split.rest.length === 0) usage();
       await cmdContext(project, split.rest.join(" "));
+      break;
+    }
+    case "why": {
+      const split = splitProjectFromVariadic(args);
+      const project = requireProject(split.project);
+      if (split.rest.length === 0) usage();
+      await cmdWhy(project, split.rest.join(" "));
       break;
     }
     case "session-end": {

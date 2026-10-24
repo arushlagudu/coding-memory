@@ -16,6 +16,7 @@ import {
   isAuthRelatedFile,
   isCodeFile,
   isQualityMessage,
+  redactSecrets,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
 
@@ -54,7 +55,7 @@ server.registerTool(
     const scoredMemories = memories
       .map((memory) => ({
         ...memory,
-        decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0),
+        decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0, memory.pinned ?? false),
       }))
       .sort((a, b) => b.decay_score - a.decay_score);
 
@@ -224,6 +225,8 @@ server.registerTool(
     },
   },
   async ({ project, type, content }) => {
+    content = redactSecrets(content);
+
     const { data: existingRows, error: existingError } = await supabase
       .from("memories")
       .select("id, content")
@@ -261,7 +264,7 @@ server.registerTool(
 
     const { data: inserted, error } = await supabase
       .from("memories")
-      .insert({ project, type, content, device_id: getDeviceId() })
+      .insert({ project, type, content, device_id: getDeviceId(), source: "mcp" })
       .select("id")
       .single();
 

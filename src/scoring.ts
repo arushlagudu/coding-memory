@@ -202,13 +202,27 @@ export function decideSaveAction(
 // --- memory decay --------------------------------------------------------
 
 // Decay constant tuned for a ~14-day half-life: exp(-0.05 * 14) ≈ 0.5.
-const DECAY_LAMBDA = 0.05;
+// Overridable per-project via .stackmem.json's decayLambda (src/config-file.ts).
+export const DEFAULT_DECAY_LAMBDA = 0.05;
+
+// A pinned memory always sorts first and never decays — 999 is well above
+// any value the exponential formula below can produce, so ranking by this
+// score alone puts every pinned memory ahead of every unpinned one.
+const PINNED_SCORE = 999;
 
 // Recency-weighted relevance: frequently-accessed memories decay slower,
-// but every memory still fades over time regardless of access count.
-export function computeDecayScore(createdAt: Date, accessCount: number): number {
+// but every memory still fades over time regardless of access count —
+// unless pinned.
+export function computeDecayScore(
+  createdAt: Date,
+  accessCount: number,
+  pinned = false,
+  lambda = DEFAULT_DECAY_LAMBDA
+): number {
+  if (pinned) return PINNED_SCORE;
+
   const daysSinceCreated = (Date.now() - createdAt.getTime()) / (1000 * 60 * 60 * 24);
-  return (1 + Math.log(1 + accessCount)) * Math.exp(-DECAY_LAMBDA * daysSinceCreated);
+  return (1 + Math.log(1 + accessCount)) * Math.exp(-lambda * daysSinceCreated);
 }
 
 // --- context budget ------------------------------------------------------
@@ -485,4 +499,30 @@ export function scoreMemoryRelevance(memoryContent: string, task: string): numbe
 
   return structuralScore * 0.7 + wordOverlapRatio * 0.3;
 }
+
+// --- task-aware ranking signals (branch name / PR title overlap) -----------
+
+const TOKEN_SPLIT_RE = /[^a-zA-Z0-9]+/;
+const MIN_TOKEN_LENGTH = 3;
+
+// Branch names and PR titles use "/", "-", "_" as word separators (e.g.
+// "feature/stripe-webhook-retry"), unlike prose content — splitWords above
+// only splits on whitespace, so it can't tokenize these the same way.
+export function tokenize(text: string): Set<string> {
+  const tokens = new Set<string>();
+  for (const word of text.toLowerCase().split(TOKEN_SPLIT_RE)) {
+    if (word.length >= MIN_TOKEN_LENGTH && !STOP_WORDS.has(word)) {
+      tokens.add(word);
+    }
+  }
+  return tokens;
+}
+
+export function hasTokenOverlap(a: Set<string>, b: Set<string>): boolean {
+  for (const token of a) {
+    if (b.has(token)) return true;
+  }
+  return false;
+}
+
 // TODO: optimize the clustering algorithm
