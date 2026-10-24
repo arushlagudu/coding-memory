@@ -11,6 +11,7 @@
 - built stripe webhook handler with error handling
 - feat: diff-first hierarchy, commit quality filter, first-commit fix
 - feat: dynamic project name from .stackmem, fix init ordering, seed memories on init
+- feat: Phase 1 — local rules sync, post-rewrite hook, SHA idempotency, diff cap, Node check, backoff, provenance, cm why, cm pin, task-aware start, .stackmem.json config
 - feat: cm doctor, cm undo, cm export, cm import — Phase 4 and 5 complete
 - feat: add cm link command for device linking
 - feat: Phase 0 — cm uninstall, non-blocking hook, hook chaining, secret redaction, conventional commit routing, regression tests, cm doctor --fix
@@ -36,5 +37,5 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 - webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/22/2026, 8:33:17 PM*
+*Last updated: 10/23/2026, 10:25:55 PM*
 *Run `cm start` for full details with decay scores*
