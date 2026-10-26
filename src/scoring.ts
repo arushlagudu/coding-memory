@@ -73,7 +73,9 @@ function trigramSet(text: string): Set<string> {
 // similarity (typos, partial substrings, shared phrasing) that word-based
 // containment misses entirely, since containment only ever compares whole
 // extracted entities.
-function ngramOverlap(a: string, b: string): number {
+// Exported for direct unit testing (src/tests/scoring.test.ts) — hybridScore
+// is the only production caller.
+export function ngramOverlap(a: string, b: string): number {
   const trigramsA = trigramSet(a);
   const trigramsB = trigramSet(b);
   const union = new Set([...trigramsA, ...trigramsB]);
@@ -145,7 +147,9 @@ const NEGATION_WORDS = [
   "deprecated", "reverted", "changed",
 ];
 
-function containsNegationWord(text: string): boolean {
+// Exported for direct unit testing (src/tests/scoring.test.ts) — decideSaveAction
+// is the only production caller.
+export function containsNegationWord(text: string): boolean {
   const lower = text.toLowerCase();
   return NEGATION_WORDS.some((word) => lower.includes(word));
 }
@@ -200,6 +204,18 @@ export function decideSaveAction(
 }
 
 // --- memory decay --------------------------------------------------------
+
+// Supabase/PostgREST sometimes returns a timestamptz column without an
+// explicit UTC suffix (e.g. "2026-10-26T00:36:16.36535" — no "Z" or
+// offset — even though the underlying value is UTC). The bare `new
+// Date(...)` constructor then parses that as LOCAL time, silently
+// shifting every timestamp by the machine's UTC offset — several hours
+// of error on every decay score, and a negative "N seconds ago" for
+// anything created in roughly the last half-day. Normalize first.
+export function parseUtcDate(dateString: string): Date {
+  const hasTimezone = /[Zz]$|[+-]\d{2}:?\d{2}$/.test(dateString);
+  return new Date(hasTimezone ? dateString : `${dateString}Z`);
+}
 
 // Decay constant tuned for a ~14-day half-life: exp(-0.05 * 14) ≈ 0.5.
 // Overridable per-project via .stackmem.json's decayLambda (src/config-file.ts).

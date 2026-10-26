@@ -16,6 +16,7 @@ import {
   isAuthRelatedFile,
   isCodeFile,
   isQualityMessage,
+  parseUtcDate,
   redactSecrets,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
@@ -44,7 +45,8 @@ server.registerTool(
       .from("memories")
       .select("*")
       .eq("project", project)
-      .eq("resolved", false);
+      .eq("resolved", false)
+      .eq("suggested", false);
 
     if (error) {
       throw new Error(`Failed to load memories: ${error.message}`);
@@ -55,7 +57,7 @@ server.registerTool(
     const scoredMemories = memories
       .map((memory) => ({
         ...memory,
-        decay_score: computeDecayScore(new Date(memory.created_at), memory.access_count ?? 0, memory.pinned ?? false),
+        decay_score: computeDecayScore(parseUtcDate(memory.created_at), memory.access_count ?? 0, memory.pinned ?? false),
       }))
       .sort((a, b) => b.decay_score - a.decay_score);
 
@@ -159,7 +161,8 @@ async function compressMemories(
     .from("memories")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false);
+    .eq("resolved", false)
+    .eq("suggested", false);
 
   if (error) {
     throw new Error(`Failed to load memories for compression: ${error.message}`);

@@ -24,6 +24,7 @@ import {
   isCodeFile,
   hasTokenOverlap,
   isQualityMessage,
+  parseUtcDate,
   redactSecrets,
   scoreMemoryRelevance,
   tokenize,
@@ -71,7 +72,7 @@ const TYPE_LABELS: Record<MemoryType, string> = {
 
 function usage(): never {
   console.error(`Usage:
-  cm start [project]
+  cm start [project] [--hook]
   cm save [project] <type> <content> [--force]  (type: decision|rejection|constraint|discovery)
   cm fix [project] <problem> <solution>
   cm analyze [project] <path>
@@ -79,17 +80,22 @@ function usage(): never {
   cm resolve [project] <memory-id>
   cm pin [project] <memory-id>
   cm unpin [project] <memory-id>
+  cm review [--project <name>]
+  cm edit [project] <memory-id>
   cm delete [project] <memory-id>
   cm inspect [project] <memory-id>
   cm compress [project]
   cm init <project> <path> [--config]
   cm uninstall [project] [path]
   cm link
+  cm open [--project <name>]
+  cm purge [--project <name>] [--all]
   cm sync
-  cm context [--project <name>] <task>
+  cm context [--project <name>] <task> [--hook]
   cm why [--project <name>] <file>
-  cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
+  cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>] [--hook]
   cm doctor [--fix]
+  cm status [--project <name>]
   cm undo [project]
   cm export [filename]
   cm import [project] <filename>
@@ -111,11 +117,13 @@ function cmdHelp() {
   [project] is optional everywhere below if a .stackmem file exists in
   the current directory (written by 'cm init'). Otherwise pass it explicitly.
 
-  cm start [project]
+  cm start [project] [--hook]
       Load all unresolved memories for a project, sorted by decay
       score and capped at a 2000 token context budget, grouped by
       type (decisions, constraints, discoveries, rejections), with
-      linked memory ids shown under each entry.
+      linked memory ids shown under each entry. --hook switches to
+      plain-text output (no ids, scores, or separator lines) for use
+      as a Claude Code SessionStart hook command — see cm init.
 
   cm save [project] <type> <content> [--force]
       Save a new memory. <type> is one of: decision, rejection,
@@ -146,6 +154,18 @@ function cmdHelp() {
 
   cm unpin [project] <memory-id>
       Un-pin a memory, returning it to normal decay-based ranking.
+
+  cm review [--project <name>]
+      Walk through suggested memories one at a time (hook-captured
+      memories start as suggested — see cm save/cm init). For each:
+      (k)eep promotes it to permanent, (e)dit opens $EDITOR (or an
+      inline prompt) for new content then keeps it, (d)rop deletes
+      it, (s)kip leaves it suggested for next time, (q)uit stops and
+      reports progress so far. Prints a kept/dropped/skipped summary.
+
+  cm edit [project] <memory-id>
+      Open a memory's content in $EDITOR (or an inline prompt if
+      $EDITOR isn't set), save the result.
 
   cm delete [project] <memory-id>
       Delete a memory and any memory_links referencing it.
@@ -194,6 +214,20 @@ function cmdHelp() {
       single-use and expires after 10 minutes; polling stops when it
       does. Links are per-device, so run this once on each machine.
 
+  cm open [--project <name>]
+      Open the hosted vault's page for this project in the default
+      browser (open on Mac, xdg-open on Linux, start on Windows).
+
+  cm purge [--project <name>] [--all]
+      Permanently delete memories, fixes, and memory_links — with a
+      typed confirmation first, never deletes on a flag alone.
+      --project (or the one in .stackmem): deletes that project's
+      data only, after you type the exact project name to confirm.
+      --all: deletes everything for this device's device_id across
+      every project, after you type DELETE to confirm. Prints the
+      count of deleted records, or "Confirmation did not match" if
+      you abort.
+
   cm sync
       Regenerate .cursorrules and .windsurfrules from the project's
       current unresolved memories (decay-ranked, capped at a 2000
@@ -201,11 +235,13 @@ function cmdHelp() {
       overwriting both files on disk only (never git add/commit).
       Project is read from .stackmem.
 
-  cm context [--project <name>] <task>
+  cm context [--project <name>] <task> [--hook]
       Return only the top 5 memories most relevant to a specific
       task, ranked by a blend of task relevance and decay score,
       as a markdown block capped at a 2000 token budget. Use
       --project to target a project other than the one in .stackmem.
+      <task> is optional with --hook (ranks by decay alone) — used
+      as a Claude Code PreCompact hook command; see cm init.
 
   cm why [--project <name>] <file>
       Show memories tied to a file: matched by Item 6's file_paths
@@ -215,7 +251,7 @@ function cmdHelp() {
       nothing matches. Use --project to target a project other than
       the one in .stackmem.
 
-  cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>]
+  cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>] [--hook]
       Capture what happened in a session and extract memories: each
       error becomes an unsolved execution_log entry, each approach
       containing "failed", "didn't work", "reverted", or "switched
@@ -225,6 +261,11 @@ function cmdHelp() {
       Accepts the same fields as JSON on stdin instead of flags
       (project, summary, errors_encountered, files_touched,
       approaches_tried) when stdin is piped rather than a terminal.
+      --hook is accepted for use as a Claude Code Stop hook command
+      (see cm init) but is currently a no-op: Claude Code pipes its
+      own hook payload on stdin, not this command's expected shape,
+      so a Stop-triggered run captures 0 memories until a future
+      phase parses the session transcript directly.
 
   cm doctor [--fix]
       Check every integration point in the current directory — backend
@@ -236,6 +277,12 @@ function cmdHelp() {
       (they need a working network, 'cm init', or a commit respectively)
       — those print guidance instead. Reports "Fixed: <item>" or
       "Could not auto-fix: <item>" for each failing check.
+
+  cm status [--project <name>]
+      One-screen project summary: memory/pinned/suggested counts,
+      recorded fixes, the active token budget (and whether it's the
+      default or from .stackmem.json), time since the last capture,
+      and hook/MCP/backend/editor registration status.
 
   cm undo [project]
       Delete the most recently saved unresolved memory (and any
@@ -265,11 +312,35 @@ function fail(message: string): never {
 
 const STACKMEM_FILE = ".stackmem";
 
+const MONOREPO_PARENT_LOOKUP_DEPTH = 3;
+
+// Checks cwd, then up to 3 parent directories, for a .stackmem file — a
+// monorepo subpackage (e.g. packages/api) won't have its own .stackmem,
+// but the repo root will. When found in an ancestor, the project name
+// gets the intervening path segments appended, e.g. "myapp/packages/api"
+// — so a subpackage still reads/writes under its own namespace within
+// the shared project, rather than silently resolving to just "myapp".
 function readProjectFromFile(): string | null {
-  const stackmemPath = nodePath.join(process.cwd(), STACKMEM_FILE);
-  if (!nodeFs.existsSync(stackmemPath)) return null;
-  const content = nodeFs.readFileSync(stackmemPath, "utf-8").trim();
-  return content.length > 0 ? content : null;
+  let dir = process.cwd();
+  const subdirSegments: string[] = [];
+
+  for (let depth = 0; depth <= MONOREPO_PARENT_LOOKUP_DEPTH; depth++) {
+    const stackmemPath = nodePath.join(dir, STACKMEM_FILE);
+    if (nodeFs.existsSync(stackmemPath)) {
+      const content = nodeFs.readFileSync(stackmemPath, "utf-8").trim();
+      if (content.length === 0) return null;
+      return subdirSegments.length > 0
+        ? `${content}/${subdirSegments.reverse().join("/")}`
+        : content;
+    }
+
+    const parent = nodePath.dirname(dir);
+    if (parent === dir) break; // reached the filesystem root
+    subdirSegments.push(nodePath.basename(dir));
+    dir = parent;
+  }
+
+  return null;
 }
 
 // Catches the common habit-slip of typing `cm fix . "problem" "solution"` by
@@ -352,24 +423,52 @@ const BRANCH_NAME_BOOST = 1.2;
 const RECENT_FILES_BOOST = 1.3;
 const PR_TITLE_BOOST = 1.2;
 
-// null means "signal unavailable" (git/gh failed, detached HEAD, not
-// enough history, gh not installed, no open PR, etc.) — every one of
-// these is a soft skip, never an error, per the task spec.
+// null means "signal unavailable" (git/gh failed, not enough history, gh
+// not installed, no open PR, etc.) — every one of these is a soft skip,
+// never an error, per the task spec.
 function getBranchNameTokens(): Set<string> | null {
+  let branch: string;
   try {
-    const branch = execFileSync("git", ["rev-parse", "--abbrev-ref", "HEAD"], {
+    // symbolic-ref (not rev-parse --abbrev-ref) specifically because it
+    // fails on a detached HEAD rather than returning the literal string
+    // "HEAD" — that failure is the signal this needs to distinguish a
+    // real detached-HEAD state from "not a git repo at all" below.
+    branch = execFileSync("git", ["symbolic-ref", "--short", "HEAD"], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
-    if (!branch || branch === "HEAD") return null; // detached HEAD
-    const tokens = tokenize(branch);
-    return tokens.size > 0 ? tokens : null;
   } catch {
-    return null;
+    try {
+      execFileSync("git", ["rev-parse", "HEAD"], { stdio: "pipe" });
+      // HEAD resolves to a real commit but symbolic-ref failed — genuinely
+      // detached, not a missing repo. Still a valid state to rank in, not
+      // a reason to skip the signal entirely.
+      branch = "detached";
+    } catch {
+      return null;
+    }
   }
+
+  const tokens = tokenize(branch);
+  return tokens.size > 0 ? tokens : null;
 }
 
 function getRecentlyTouchedFiles(): Set<string> | null {
+  try {
+    const isShallow = execFileSync("git", ["rev-parse", "--is-shallow-repository"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    // A shallow clone can't look back RECENT_COMMITS_FOR_FILE_SIGNAL
+    // commits — degrade gracefully rather than attempting (and either
+    // failing, or silently returning an incomplete picture of "recent").
+    if (isShallow === "true") return null;
+  } catch {
+    // --is-shallow-repository itself failing (very old git, or no repo at
+    // all) isn't a reason to skip on its own — the lookback below will
+    // fail (and get caught) or succeed on its own merits either way.
+  }
+
   try {
     const output = execFileSync(
       "git",
@@ -413,20 +512,62 @@ function fileListOverlaps(filePaths: unknown, recentFiles: Set<string>): boolean
   });
 }
 
-async function cmdStart(project: string) {
+// Plain-text, no ids/scores/box-drawing — meant to be injected directly
+// into a Claude Code SessionStart hook's context, not read by a human at
+// a terminal (that's the default, non---hook rendering below).
+function printStartHookOutput(
+  project: string,
+  pinnedMemories: any[],
+  unpinnedMemories: any[],
+  budgetedFixes: { problem: string; solution: string | null }[]
+): void {
+  console.log(`# Project memory: ${project}`);
+
+  if (pinnedMemories.length > 0) {
+    console.log("");
+    console.log("## Pinned");
+    for (const memory of pinnedMemories) {
+      console.log(`- ${memory.content}`);
+    }
+  }
+
+  for (const type of MEMORY_TYPES) {
+    const group = unpinnedMemories.filter((m) => m.type === type);
+    if (group.length === 0) continue;
+
+    console.log("");
+    console.log(`## ${TYPE_LABELS[type]}`);
+    for (const memory of group) {
+      console.log(`- ${memory.content}`);
+    }
+  }
+
+  if (budgetedFixes.length > 0) {
+    console.log("");
+    console.log("## Past Fixes");
+    for (const fix of budgetedFixes) {
+      console.log(`- ${fix.problem} -> ${fix.solution ?? "(pending)"}`);
+    }
+  }
+}
+
+async function cmdStart(project: string, hookMode = false) {
   const { data, error } = await supabase
     .from("memories")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false);
+    .eq("resolved", false)
+    .eq("suggested", false);
 
   if (error) fail(`Failed to load memories: ${error.message}`);
 
   const memories = data ?? [];
   if (memories.length === 0) {
-    console.log(`No memories found for "${project}".`);
-    console.log("");
-    console.log("Tip: run 'cm init' to seed tech stack memories from your project files.");
+    if (!hookMode) {
+      console.log(`No memories found for "${project}".`);
+      console.log("");
+      console.log("Tip: run 'cm init' to seed tech stack memories from your project files.");
+    }
     return;
   }
 
@@ -444,7 +585,7 @@ async function cmdStart(project: string) {
   const scoredMemories = memories
     .map((memory) => {
       let decayScore = computeDecayScore(
-        new Date(memory.created_at),
+        parseUtcDate(memory.created_at),
         memory.access_count ?? 0,
         memory.pinned ?? false,
         config.decayLambda
@@ -510,59 +651,63 @@ async function cmdStart(project: string) {
     linkedIdsByMemory.get(link.target_id)!.add(link.source_id);
   }
 
-  console.log(`Loaded ${scoredMemories.length} memory(ies) for "${project}".\n`);
-
   const pinnedMemories = budgetedMemories.filter((m) => m.pinned);
   const unpinnedMemories = budgetedMemories.filter((m) => !m.pinned);
 
-  if (pinnedMemories.length > 0) {
-    console.log(`Pinned (${pinnedMemories.length})`);
-    console.log("-".repeat(11));
-    for (const memory of pinnedMemories) {
-      console.log(`  [${memory.id}] (${memory.type}) ${memory.content}`);
-      const linked = Array.from(linkedIdsByMemory.get(memory.id) ?? []);
-      if (linked.length > 0) {
-        console.log(`      linked: ${linked.join(", ")}`);
+  if (hookMode) {
+    printStartHookOutput(project, pinnedMemories, unpinnedMemories, budgetedFixes);
+  } else {
+    console.log(`Loaded ${scoredMemories.length} memory(ies) for "${project}".\n`);
+
+    if (pinnedMemories.length > 0) {
+      console.log(`Pinned (${pinnedMemories.length})`);
+      console.log("-".repeat(11));
+      for (const memory of pinnedMemories) {
+        console.log(`  [${memory.id}] (${memory.type}) ${memory.content}`);
+        const linked = Array.from(linkedIdsByMemory.get(memory.id) ?? []);
+        if (linked.length > 0) {
+          console.log(`      linked: ${linked.join(", ")}`);
+        }
       }
-    }
-    console.log("");
-  }
-
-  for (const type of MEMORY_TYPES) {
-    const group = unpinnedMemories.filter((m) => m.type === type);
-    if (group.length === 0) continue;
-
-    console.log(`${TYPE_LABELS[type]} (${group.length})`);
-    console.log("-".repeat(TYPE_LABELS[type].length + 4));
-    for (const memory of group) {
-      console.log(`  [${memory.id}] (score: ${memory.decay_score.toFixed(2)}) ${memory.content}`);
-      const linked = Array.from(linkedIdsByMemory.get(memory.id) ?? []);
-      if (linked.length > 0) {
-        console.log(`      linked: ${linked.join(", ")}`);
-      }
-    }
-    console.log("");
-  }
-
-  if (budgetedFixes.length > 0) {
-    console.log(`Past Fixes (${budgetedFixes.length})`);
-    console.log("-".repeat(14));
-    for (const fix of budgetedFixes) {
-      console.log(`  Problem: ${fix.problem}`);
-      console.log(`  Solution: ${fix.solution ?? "(pending)"}`);
       console.log("");
     }
-  }
 
-  console.log(`Context budget: ${tokensUsed}/${tokenBudget} tokens used`);
-  if (omittedCount > 0) {
-    console.log(`${omittedCount} memories omitted (budget exceeded)`);
-  }
+    for (const type of MEMORY_TYPES) {
+      const group = unpinnedMemories.filter((m) => m.type === type);
+      if (group.length === 0) continue;
 
-  const hasTechStackMemory = memories.some((m) => /^tech stack:/i.test(m.content));
-  if (!hasTechStackMemory) {
-    console.log("");
-    console.log("Tip: run 'cm init' to seed tech stack memories from your project files.");
+      console.log(`${TYPE_LABELS[type]} (${group.length})`);
+      console.log("-".repeat(TYPE_LABELS[type].length + 4));
+      for (const memory of group) {
+        console.log(`  [${memory.id}] (score: ${memory.decay_score.toFixed(2)}) ${memory.content}`);
+        const linked = Array.from(linkedIdsByMemory.get(memory.id) ?? []);
+        if (linked.length > 0) {
+          console.log(`      linked: ${linked.join(", ")}`);
+        }
+      }
+      console.log("");
+    }
+
+    if (budgetedFixes.length > 0) {
+      console.log(`Past Fixes (${budgetedFixes.length})`);
+      console.log("-".repeat(14));
+      for (const fix of budgetedFixes) {
+        console.log(`  Problem: ${fix.problem}`);
+        console.log(`  Solution: ${fix.solution ?? "(pending)"}`);
+        console.log("");
+      }
+    }
+
+    console.log(`Context budget: ${tokensUsed}/${tokenBudget} tokens used`);
+    if (omittedCount > 0) {
+      console.log(`${omittedCount} memories omitted (budget exceeded)`);
+    }
+
+    const hasTechStackMemory = memories.some((m) => /^tech stack:/i.test(m.content));
+    if (!hasTechStackMemory) {
+      console.log("");
+      console.log("Tip: run 'cm init' to seed tech stack memories from your project files.");
+    }
   }
 
   const incrementResults = await Promise.all(
@@ -681,6 +826,11 @@ async function cmdSave(
     device_id: getDeviceId(),
     source,
     confidence,
+    // Hook-captured memories are heuristically detected and could be
+    // noisy or wrong — they start as suggested, pending `cm review`, and
+    // are excluded from cm start/context/why until promoted. Manual and
+    // mcp saves are already user-vetted, so they're permanent immediately.
+    suggested: source === "hook",
   };
   if (commitSha) insertPayload.commit_sha = commitSha;
   if (filePaths && filePaths.length > 0) insertPayload.file_paths = filePaths;
@@ -767,7 +917,8 @@ async function compressMemories(
     .from("memories")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false);
+    .eq("resolved", false)
+    .eq("suggested", false);
 
   if (error) fail(`Failed to load memories for compression: ${error.message}`);
 
@@ -971,10 +1122,173 @@ async function cmdDelete(project: string, memoryId: string) {
   console.log(`Deleted memory [${memoryId}]`);
 }
 
+// --- shared: relative time + $EDITOR prompt (cm review, cm edit, cm status)
+
+function formatRelativeTime(date: Date): string {
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return `${seconds} second${seconds === 1 ? "" : "s"} ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
+// Opens $EDITOR on a scratch file pre-filled with the current content, or
+// falls back to an inline readline prompt when $EDITOR isn't set. Returns
+// the original content unchanged if the result is blank (an empty save
+// buffer almost certainly means "I didn't mean to clear this", not "make
+// this memory empty").
+async function editContentInteractively(currentContent: string): Promise<string> {
+  const editor = process.env.EDITOR;
+
+  if (editor) {
+    const tmpFile = nodePath.join(nodeOs.tmpdir(), `stackmem-edit-${randomInt(1_000_000_000)}.txt`);
+    nodeFs.writeFileSync(tmpFile, currentContent, "utf-8");
+    try {
+      execFileSync(editor, [tmpFile], { stdio: "inherit" });
+      const edited = nodeFs.readFileSync(tmpFile, "utf-8").trim();
+      return edited.length > 0 ? edited : currentContent;
+    } finally {
+      try {
+        nodeFs.unlinkSync(tmpFile);
+      } catch {
+        // Best-effort cleanup — a leftover temp file isn't worth failing on.
+      }
+    }
+  }
+
+  console.log(`Current: ${currentContent}`);
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question("New content (leave blank to keep unchanged): ")).trim();
+  rl.close();
+  return answer.length > 0 ? answer : currentContent;
+}
+
+// --- cm review -------------------------------------------------------------
+
+async function cmdReview(project: string): Promise<void> {
+  const { data, error } = await supabase
+    .from("memories")
+    .select("*")
+    .eq("project", project)
+    .eq("resolved", false)
+    .eq("suggested", true)
+    .order("created_at", { ascending: true });
+
+  if (error) fail(`Failed to load suggested memories: ${error.message}`);
+
+  const memories = data ?? [];
+  if (memories.length === 0) {
+    console.log(`No memories to review for "${project}".`);
+    console.log("Your inbox is empty.");
+    return;
+  }
+
+  console.log(`Reviewing ${memories.length} suggested memories for "${project}"`);
+  console.log("━".repeat(40));
+
+  // Node's readline can't reliably answer multiple sequential
+  // rl.question() calls over piped (non-TTY) stdin — all buffered input
+  // arrives before the second question is even issued, and it never
+  // resolves. A real interactive terminal doesn't hit this (keystrokes
+  // arrive one at a time), so only the non-TTY path needs the
+  // read-everything-up-front workaround.
+  const rl = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : null;
+  const pipedAnswers: string[] = rl
+    ? []
+    : (
+        await new Promise<string>((resolve) => {
+          let buf = "";
+          process.stdin.setEncoding("utf-8");
+          process.stdin.on("data", (chunk) => (buf += chunk));
+          process.stdin.on("end", () => resolve(buf));
+        })
+      ).split("\n");
+
+  async function nextAnswer(prompt: string): Promise<string> {
+    if (rl) return (await rl.question(prompt)).trim().toLowerCase();
+    console.log(prompt);
+    return (pipedAnswers.shift() ?? "q").trim().toLowerCase();
+  }
+
+  let kept = 0;
+  let dropped = 0;
+  let skipped = 0;
+
+  for (let i = 0; i < memories.length; i++) {
+    const memory = memories[i];
+    console.log(`[${i + 1}/${memories.length}] ${memory.type}: ${memory.content}`);
+    console.log(`      Captured: ${formatRelativeTime(parseUtcDate(memory.created_at))}`);
+    console.log("");
+
+    const answer = await nextAnswer("(k)eep  (e)dit  (d)rop  (s)kip  (q)uit > ");
+    console.log("");
+
+    if (answer === "k") {
+      const { error: updateError } = await supabase
+        .from("memories")
+        .update({ suggested: false })
+        .eq("id", memory.id);
+      if (!updateError) kept++;
+    } else if (answer === "e") {
+      const newContent = redactSecrets(await editContentInteractively(memory.content));
+      const { error: updateError } = await supabase
+        .from("memories")
+        .update({ content: newContent, suggested: false })
+        .eq("id", memory.id);
+      if (!updateError) kept++;
+    } else if (answer === "d") {
+      await supabase
+        .from("memory_links")
+        .delete()
+        .or(`source_id.eq.${memory.id},target_id.eq.${memory.id}`);
+      const { error: deleteError } = await supabase.from("memories").delete().eq("id", memory.id);
+      if (!deleteError) dropped++;
+    } else if (answer === "q") {
+      break;
+    } else {
+      // "s", blank, or anything unrecognized — leave it suggested and
+      // move on rather than erroring on a mistyped key.
+      skipped++;
+    }
+  }
+
+  rl?.close();
+  console.log(`Review complete. Kept ${kept}, dropped ${dropped}, skipped ${skipped}.`);
+}
+
+// --- cm edit ---------------------------------------------------------------
+
+async function cmdEdit(project: string, memoryId: string): Promise<void> {
+  const { data: memory, error } = await supabase
+    .from("memories")
+    .select("id, content")
+    .eq("project", project)
+    .eq("id", memoryId)
+    .single();
+
+  if (error || !memory) {
+    console.log(`No memory found with ID [${memoryId}]`);
+    return;
+  }
+
+  const newContent = redactSecrets(await editContentInteractively(memory.content));
+  const { error: updateError } = await supabase
+    .from("memories")
+    .update({ content: newContent })
+    .eq("id", memoryId);
+
+  if (updateError) fail(`Failed to update memory: ${updateError.message}`);
+
+  console.log(`Updated memory [${memoryId}].`);
+}
+
 // --- cm inspect ------------------------------------------------------------
 
 function formatDate(dateString: string): string {
-  return new Date(dateString).toLocaleDateString("en-US", {
+  return parseUtcDate(dateString).toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
     year: "numeric",
@@ -993,7 +1307,7 @@ async function cmdInspect(project: string, memoryId: string) {
 
   const config = readStackmemConfig();
   const decayScore = computeDecayScore(
-    new Date(memory.created_at),
+    parseUtcDate(memory.created_at),
     memory.access_count ?? 0,
     memory.pinned ?? false,
     config.decayLambda
@@ -1717,6 +2031,122 @@ function unregisterMcpServer(claudeConfigPath = getClaudeConfigPath()): boolean 
   return true;
 }
 
+// --- MCP registration for other editors ---------------------------------
+
+// Each entry detects its editor by an existing config directory (never
+// erroring if absent — "skip silently" per the task) and merges stackmem
+// into whatever's already there, same spirit as registerMcpServer above.
+// homeDir is a parameter (not a hardcoded nodeOs.homedir() call) so tests
+// can point at a scratch directory instead of the real one.
+interface EditorMcpTarget {
+  name: string;
+  configPath: (homeDir: string) => string | null;
+  register: (configPath: string, distIndexPath: string) => void;
+}
+
+function mergeMcpServersJson(configPath: string, distIndexPath: string): void {
+  let config: { mcpServers?: Record<string, unknown> } = {};
+  if (nodeFs.existsSync(configPath)) {
+    try {
+      config = JSON.parse(nodeFs.readFileSync(configPath, "utf-8"));
+    } catch {
+      config = {};
+    }
+  }
+  if (!config.mcpServers || typeof config.mcpServers !== "object") {
+    config.mcpServers = {};
+  }
+  config.mcpServers.stackmem = { command: "node", args: [distIndexPath] };
+
+  nodeFs.mkdirSync(nodePath.dirname(configPath), { recursive: true });
+  nodeFs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+}
+
+// VS Code installs the Copilot Chat extension under a version-suffixed
+// directory name (e.g. "github.copilot-chat-0.26.4") — this resolves the
+// "github.copilot-chat*" glob the task describes against whatever's
+// actually installed, rather than assuming a fixed folder name.
+function findCopilotChatExtensionDir(homeDir: string): string | null {
+  const extensionsDir = nodePath.join(homeDir, ".vscode", "extensions");
+  if (!nodeFs.existsSync(extensionsDir)) return null;
+
+  try {
+    const match = nodeFs
+      .readdirSync(extensionsDir)
+      .find((entry) => entry.startsWith("github.copilot-chat"));
+    return match ? nodePath.join(extensionsDir, match) : null;
+  } catch {
+    return null;
+  }
+}
+
+const EDITOR_MCP_TARGETS: EditorMcpTarget[] = [
+  {
+    name: "Cursor",
+    configPath: (homeDir) => {
+      const dir = nodePath.join(homeDir, ".cursor");
+      return nodeFs.existsSync(dir) ? nodePath.join(dir, "mcp.json") : null;
+    },
+    register: mergeMcpServersJson,
+  },
+  {
+    name: "Windsurf",
+    configPath: (homeDir) => {
+      const dir = nodePath.join(homeDir, ".codeium", "windsurf");
+      return nodeFs.existsSync(dir) ? nodePath.join(dir, "mcp_config.json") : null;
+    },
+    register: mergeMcpServersJson,
+  },
+  {
+    name: "VS Code (Copilot)",
+    configPath: (homeDir) => {
+      const extensionDir = findCopilotChatExtensionDir(homeDir);
+      return extensionDir ? nodePath.join(extensionDir, "mcp.json") : null;
+    },
+    register: mergeMcpServersJson,
+  },
+  {
+    name: "Zed",
+    configPath: (homeDir) => {
+      const dir = nodePath.join(homeDir, ".config", "zed");
+      return nodeFs.existsSync(dir) ? nodePath.join(dir, "settings.json") : null;
+    },
+    register: (configPath, distIndexPath) => {
+      let config: { context_servers?: Record<string, unknown> } = {};
+      if (nodeFs.existsSync(configPath)) {
+        try {
+          config = JSON.parse(nodeFs.readFileSync(configPath, "utf-8"));
+        } catch {
+          config = {};
+        }
+      }
+      if (!config.context_servers || typeof config.context_servers !== "object") {
+        config.context_servers = {};
+      }
+      config.context_servers.stackmem = { command: "node", args: [distIndexPath] };
+      nodeFs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+    },
+  },
+];
+
+// Registers stackmem's MCP server with every detected editor, printing a
+// line per success. An editor whose config directory doesn't exist is
+// skipped with no output and never an error.
+function registerEditorMcpServers(distIndexPath: string, homeDir = nodeOs.homedir()): void {
+  for (const target of EDITOR_MCP_TARGETS) {
+    const configPath = target.configPath(homeDir);
+    if (!configPath) continue;
+
+    try {
+      target.register(configPath, distIndexPath);
+      console.log(`✓ MCP registered for ${target.name}`);
+    } catch {
+      // Best-effort — a permissions error or malformed existing config on
+      // one editor shouldn't abort `cm init` or the other editors' writes.
+    }
+  }
+}
+
 const DEFAULT_GITIGNORE_CONTENT = `node_modules/
 dist/
 .env
@@ -1728,6 +2158,7 @@ coverage/
 *.db
 *cursorrules
 *windsurfrules
+.cursor/rules/stackmem.md
 `;
 
 // Returns true if the file was created, false if it already existed
@@ -1767,6 +2198,109 @@ cm save ${project} <type> "<content>"
   console.log("CLAUDE.md written.");
 }
 
+// Same instructional purpose as writeClaudeMd — point the agent at
+// `cm start` rather than embedding a memory snapshot directly, since a
+// baked-in snapshot goes stale the moment the next commit lands. AGENTS.md
+// is the convention used by OpenAI Codex CLI, Gemini CLI, and others;
+// GEMINI.md is Gemini CLI's own equivalent — both get identical content.
+function writeAgentsMemoryFile(project: string, resolvedPath: string, filename: string): void {
+  const filePath = nodePath.join(resolvedPath, filename);
+
+  if (nodeFs.existsSync(filePath)) {
+    console.log(`${filename} already exists — skipping.`);
+    return;
+  }
+
+  const content = `# ${project} — Agent Memory
+
+This project uses stackmem for persistent agent memory.
+Run \`cm start ${project}\` at the start of every session
+to load relevant context.
+
+## Key decisions, constraints and discoveries
+
+Decisions, constraints, discoveries, and rejections live in the stackmem
+backend, not duplicated in this file — run \`cm start ${project}\` to load
+the current list.
+
+When you make a decision, discover a constraint, reject an approach, or
+make a discovery during this session, save it with:
+cm save ${project} <type> "<content>"
+`;
+
+  nodeFs.writeFileSync(filePath, content, "utf-8");
+  console.log(`${filename} written.`);
+}
+
+// --- Claude Code hooks (.claude/settings.json) ------------------------
+
+interface ClaudeHookHandler {
+  type: string;
+  command: string;
+}
+
+interface ClaudeHookGroup {
+  matcher?: string;
+  hooks: ClaudeHookHandler[];
+}
+
+interface ClaudeSettingsFile {
+  hooks?: Record<string, ClaudeHookGroup[]>;
+  [key: string]: unknown;
+}
+
+// --project (not positional) for the PreCompact command below: cmdContext's
+// CLI convention takes --project like cm search/cm context already do
+// everywhere else — cm start and cm session-end both take a positional
+// project, so those two keep the user's literal command shape.
+const STACKMEM_HOOK_EVENTS: { event: string; buildCommand: (project: string) => string }[] = [
+  { event: "SessionStart", buildCommand: (project) => `cm start ${project} --hook` },
+  { event: "Stop", buildCommand: (project) => `cm session-end ${project} --hook` },
+  { event: "PreCompact", buildCommand: (project) => `cm context --project ${project} --hook` },
+];
+
+// Writes (or merges into) <resolvedPath>/.claude/settings.json. Merges
+// rather than overwrites — an existing settings.json may have unrelated
+// hooks or settings that must survive this — and is idempotent: re-running
+// `cm init` checks for the exact command string already present in an
+// event's hook groups before adding another one.
+function writeClaudeCodeHooks(project: string, resolvedPath: string): void {
+  const settingsDir = nodePath.join(resolvedPath, ".claude");
+  const settingsPath = nodePath.join(settingsDir, "settings.json");
+
+  let settings: ClaudeSettingsFile = {};
+  if (nodeFs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(nodeFs.readFileSync(settingsPath, "utf-8"));
+    } catch {
+      settings = {};
+    }
+  }
+
+  if (!settings.hooks || typeof settings.hooks !== "object") {
+    settings.hooks = {};
+  }
+
+  for (const { event, buildCommand } of STACKMEM_HOOK_EVENTS) {
+    const command = buildCommand(project);
+
+    if (!Array.isArray(settings.hooks[event])) {
+      settings.hooks[event] = [];
+    }
+
+    const alreadyRegistered = settings.hooks[event].some(
+      (group) => Array.isArray(group?.hooks) && group.hooks.some((h) => h?.command === command)
+    );
+
+    if (!alreadyRegistered) {
+      settings.hooks[event].push({ hooks: [{ type: "command", command }] });
+    }
+  }
+
+  nodeFs.mkdirSync(settingsDir, { recursive: true });
+  nodeFs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), "utf-8");
+}
+
 // Section order for the generated rules-file markdown — matches the order
 // memories are presented in everywhere else (cm context's CONTEXT_TYPE_ORDER),
 // not MEMORY_TYPES' declaration order.
@@ -1781,7 +2315,8 @@ async function generateRulesContent(project: string): Promise<string> {
     .from("memories")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false);
+    .eq("resolved", false)
+    .eq("suggested", false);
 
   if (memoriesError) fail(`Failed to load memories: ${memoriesError.message}`);
 
@@ -1790,7 +2325,7 @@ async function generateRulesContent(project: string): Promise<string> {
     .map((memory) => ({
       ...memory,
       decay_score: computeDecayScore(
-        new Date(memory.created_at),
+        parseUtcDate(memory.created_at),
         memory.access_count ?? 0,
         memory.pinned ?? false,
         config.decayLambda
@@ -1865,6 +2400,19 @@ function writeCursorRules(resolvedPath: string, content: string): boolean {
   nodeFs.writeFileSync(cursorRulesPath, content, "utf-8");
   console.log(".cursorrules written.");
   return true;
+}
+
+// Cursor's newer rules format (.cursor/rules/*.md) — .cursorrules is
+// legacy but still read by older Cursor versions, so both are written
+// during the transition rather than one replacing the other. Unlike
+// writeCursorRules/writeWindsurfRules (write-once at init, skip if
+// present), this one unconditionally overwrites on every call — both at
+// init and on every `cm sync` — since it's gitignored content meant to
+// always reflect the current memory state, same as the legacy files.
+function writeCursorRulesMdFile(resolvedPath: string, content: string): void {
+  const rulesDir = nodePath.join(resolvedPath, ".cursor", "rules");
+  nodeFs.mkdirSync(rulesDir, { recursive: true });
+  nodeFs.writeFileSync(nodePath.join(rulesDir, "stackmem.md"), content, "utf-8");
 }
 
 // Returns true if the file was written, false if it already existed
@@ -2071,7 +2619,11 @@ async function cmdInit(project: string, targetPath: string, writeConfig = false)
   console.log(`coding-memory hook installed for project ${project} at ${targetPath}`);
 
   registerMcpServer(DIST_INDEX_PATH);
+  registerEditorMcpServers(DIST_INDEX_PATH);
   writeClaudeMd(project, resolvedPath);
+  writeAgentsMemoryFile(project, resolvedPath, "AGENTS.md");
+  writeAgentsMemoryFile(project, resolvedPath, "GEMINI.md");
+  writeClaudeCodeHooks(project, resolvedPath);
 
   const seededCount = await seedMemories(project, resolvedPath);
   console.log(`Seeded ${seededCount} initial memories from project scan.`);
@@ -2079,6 +2631,7 @@ async function cmdInit(project: string, targetPath: string, writeConfig = false)
   const rulesContent = await generateRulesContent(project);
   const cursorRulesWritten = writeCursorRules(resolvedPath, rulesContent);
   const windsurfRulesWritten = writeWindsurfRules(resolvedPath, rulesContent);
+  writeCursorRulesMdFile(resolvedPath, rulesContent);
 
   const backendOk = await verifyBackendConnection(project);
 
@@ -2093,13 +2646,17 @@ async function cmdInit(project: string, targetPath: string, writeConfig = false)
   }
   console.log("✓ Git hook installed");
   console.log("✓ MCP server registered");
+  console.log("✓ Claude Code hooks registered (.claude/settings.json)");
   console.log("✓ CLAUDE.md written");
+  console.log("✓ AGENTS.md written");
+  console.log("✓ GEMINI.md written");
   console.log(
     `✓ .cursorrules ${cursorRulesWritten ? "written" : "already exists"}`
   );
   console.log(
     `✓ .windsurfrules ${windsurfRulesWritten ? "written" : "already exists"}`
   );
+  console.log("✓ .cursor/rules/stackmem.md written");
   console.log(`✓ Seeded ${seededCount} memories from project scan`);
   if (backendOk) {
     console.log("✓ Backend connection verified");
@@ -2125,8 +2682,9 @@ async function cmdSync(project: string) {
 
   nodeFs.writeFileSync(nodePath.join(resolvedPath, ".cursorrules"), rulesContent, "utf-8");
   nodeFs.writeFileSync(nodePath.join(resolvedPath, ".windsurfrules"), rulesContent, "utf-8");
+  writeCursorRulesMdFile(resolvedPath, rulesContent);
 
-  console.log("Synced memories to .cursorrules and .windsurfrules");
+  console.log("Synced memories to .cursorrules, .windsurfrules, and .cursor/rules/stackmem.md");
 }
 
 // --- cm link ---------------------------------------------------------------
@@ -2211,23 +2769,148 @@ async function cmdLink() {
   console.log("Link code expired. Run cm link again.");
 }
 
+// --- cm open -----------------------------------------------------------
+
+// Separated from cmdOpen so the platform-selection logic is unit-testable
+// without actually launching a browser — exercising this for real on
+// every platform isn't something a test (or a verification pass) should
+// do as a side effect.
+export function getOpenCommand(platform: string, url: string): { command: string; args: string[] } {
+  if (platform === "darwin") return { command: "open", args: [url] };
+  if (platform === "win32") return { command: "cmd", args: ["/c", "start", "", url] };
+  return { command: "xdg-open", args: [url] };
+}
+
+async function cmdOpen(project: string): Promise<void> {
+  const url = `${VAULT_URL}/project/${project}`;
+  const { command, args } = getOpenCommand(process.platform, url);
+
+  try {
+    execFileSync(command, args, { stdio: "ignore" });
+    console.log(`Opened ${url}`);
+  } catch (error) {
+    fail(
+      `Failed to open browser (${error instanceof Error ? error.message : String(error)}). Visit ${url} manually.`
+    );
+  }
+}
+
+// --- cm purge ------------------------------------------------------------
+
+async function cmdPurgeProject(project: string): Promise<void> {
+  const { count: total, error: countError } = await supabase
+    .from("memories")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project);
+  if (countError) fail(`Failed to count memories: ${countError.message}`);
+
+  console.log(`This will permanently delete all ${total ?? 0} memories for "${project}".`);
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question("Type the project name to confirm: ")).trim();
+  rl.close();
+
+  if (answer !== project) {
+    console.log("Confirmation did not match — aborted. Nothing was deleted.");
+    return;
+  }
+
+  const { data: memRows, error: memFetchError } = await supabase
+    .from("memories")
+    .select("id")
+    .eq("project", project);
+  if (memFetchError) fail(`Failed to load memories: ${memFetchError.message}`);
+
+  const ids = (memRows ?? []).map((m) => m.id);
+  let linksDeleted = 0;
+  if (ids.length > 0) {
+    const idList = ids.join(",");
+    const { count, error: linksError } = await supabase
+      .from("memory_links")
+      .delete({ count: "exact" })
+      .or(`source_id.in.(${idList}),target_id.in.(${idList})`);
+    if (linksError) fail(`Failed to delete memory links: ${linksError.message}`);
+    linksDeleted = count ?? 0;
+  }
+
+  const { count: memoriesDeleted, error: memError } = await supabase
+    .from("memories")
+    .delete({ count: "exact" })
+    .eq("project", project);
+  if (memError) fail(`Failed to delete memories: ${memError.message}`);
+
+  const { count: fixesDeleted, error: fixError } = await supabase
+    .from("execution_log")
+    .delete({ count: "exact" })
+    .eq("project", project);
+  if (fixError) fail(`Failed to delete fixes: ${fixError.message}`);
+
+  console.log(
+    `Deleted ${memoriesDeleted ?? 0} memories, ${fixesDeleted ?? 0} fixes, and ${linksDeleted} links for "${project}".`
+  );
+}
+
+// RLS already scopes every table read/write to this device's device_id
+// via the x-device-id header (see src/storage.ts) — a filter-less delete
+// here is already confined to this device, never another one. PostgREST
+// still requires an explicit filter clause to allow a DELETE at all, so
+// `.not("id", "is", null)` (every row has a non-null id) is used purely
+// to satisfy that, not to narrow the scope further.
+async function cmdPurgeAll(): Promise<void> {
+  console.log("This will permanently delete ALL memories across ALL projects for this device.");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = (await rl.question("Type DELETE to confirm: ")).trim();
+  rl.close();
+
+  if (answer !== "DELETE") {
+    console.log("Confirmation did not match — aborted. Nothing was deleted.");
+    return;
+  }
+
+  const { count: linksDeleted, error: linksError } = await supabase
+    .from("memory_links")
+    .delete({ count: "exact" })
+    .not("id", "is", null);
+  if (linksError) fail(`Failed to delete memory links: ${linksError.message}`);
+
+  const { count: memoriesDeleted, error: memError } = await supabase
+    .from("memories")
+    .delete({ count: "exact" })
+    .not("id", "is", null);
+  if (memError) fail(`Failed to delete memories: ${memError.message}`);
+
+  const { count: fixesDeleted, error: fixError } = await supabase
+    .from("execution_log")
+    .delete({ count: "exact" })
+    .not("id", "is", null);
+  if (fixError) fail(`Failed to delete fixes: ${fixError.message}`);
+
+  console.log(
+    `Deleted ${memoriesDeleted ?? 0} memories, ${fixesDeleted ?? 0} fixes, and ${linksDeleted ?? 0} links across all projects.`
+  );
+}
+
 // --- cm context ------------------------------------------------------------
 
 const CONTEXT_TYPE_ORDER: MemoryType[] = ["decision", "constraint", "rejection", "discovery"];
 const CONTEXT_TOP_N = 5;
 
-async function cmdContext(project: string, task: string) {
+// task is null for the PreCompact hook — there's no user-typed task at a
+// compaction boundary, just "save the most relevant context" generically
+// — so ranking falls back to decay score alone instead of diluting it
+// with a relevance score computed against an empty string.
+async function cmdContext(project: string, task: string | null, hookMode = false) {
   const { data, error } = await supabase
     .from("memories")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false);
+    .eq("resolved", false)
+    .eq("suggested", false);
 
   if (error) fail(`Failed to load memories: ${error.message}`);
 
   const memories = data ?? [];
   if (memories.length === 0) {
-    console.log(`No memories found for "${project}".`);
+    if (!hookMode) console.log(`No memories found for "${project}".`);
     return;
   }
 
@@ -2237,16 +2920,14 @@ async function cmdContext(project: string, task: string) {
   const scoredMemories = memories
     .map((memory) => {
       const decayScore = computeDecayScore(
-        new Date(memory.created_at),
+        parseUtcDate(memory.created_at),
         memory.access_count ?? 0,
         memory.pinned ?? false,
         config.decayLambda
       );
-      const relevanceScore = scoreMemoryRelevance(memory.content, task);
-      return {
-        ...memory,
-        combined_score: relevanceScore * 0.6 + decayScore * 0.4,
-      };
+      const combinedScore =
+        task == null ? decayScore : scoreMemoryRelevance(memory.content, task) * 0.6 + decayScore * 0.4;
+      return { ...memory, combined_score: combinedScore };
     })
     .sort((a, b) => b.combined_score - a.combined_score);
 
@@ -2257,7 +2938,9 @@ async function cmdContext(project: string, task: string) {
     0
   );
 
-  const lines: string[] = [`## Project Context: ${project}`, `### Task: ${task}`, ""];
+  const lines: string[] = [`## Project Context: ${project}`];
+  if (task != null) lines.push(`### Task: ${task}`);
+  lines.push("");
 
   for (const type of CONTEXT_TYPE_ORDER) {
     const group = budgetedMemories.filter((memory) => memory.type === type);
@@ -2270,7 +2953,7 @@ async function cmdContext(project: string, task: string) {
     lines.push("");
   }
 
-  lines.push(`*(${tokensUsed}/${tokenBudget} tokens used)*`);
+  if (!hookMode) lines.push(`*(${tokensUsed}/${tokenBudget} tokens used)*`);
 
   console.log(lines.join("\n"));
 }
@@ -2294,7 +2977,8 @@ async function cmdWhy(project: string, file: string) {
     .from("memories")
     .select("*")
     .eq("project", project)
-    .eq("resolved", false);
+    .eq("resolved", false)
+    .eq("suggested", false);
 
   if (error) fail(`Failed to load memories: ${error.message}`);
 
@@ -2323,7 +3007,7 @@ async function cmdWhy(project: string, file: string) {
     .map((memory) => ({
       ...memory,
       decay_score: computeDecayScore(
-        new Date(memory.created_at),
+        parseUtcDate(memory.created_at),
         memory.access_count ?? 0,
         memory.pinned ?? false,
         config.decayLambda
@@ -2394,6 +3078,10 @@ function parseSessionEndFlags(args: string[]): SessionEndInput {
     } else if (flag === "--approaches") {
       approaches = splitCommaList(value);
       i++;
+    } else if (flag === "--hook") {
+      // Recognized explicitly (not just silently skipped as an unknown
+      // flag) — see the comment on cmdSessionEnd for why it's currently
+      // a no-op here specifically.
     }
   }
 
@@ -2416,6 +3104,16 @@ async function readStdinJson(): Promise<Record<string, unknown> | null> {
   }
 }
 
+// --hook is accepted (see parseSessionEndFlags) but currently a no-op:
+// Claude Code's Stop hook pipes ITS OWN JSON payload on stdin (session
+// id, transcript path, cwd — see the Claude Code hooks docs), not the
+// {summary, errors_encountered, files_touched, approaches_tried} shape
+// this command expects. readStdinJson() parses that payload successfully
+// (it's valid JSON) but finds none of the fields it looks for, so every
+// array below comes back empty and this reports 0 memories saved — a
+// real, known limitation, not a bug. Extracting genuine learnings from
+// the Stop hook would mean parsing the session transcript itself, which
+// is out of scope here (Phase 2, per the user).
 async function cmdSessionEnd(project: string, input: Omit<SessionEndInput, "project">) {
   let memoriesSaved = 0;
   let errorsLogged = 0;
@@ -2527,6 +3225,136 @@ function isHookExecutable(hookPath: string): boolean {
   } catch {
     return false;
   }
+}
+
+// --- cm status ---------------------------------------------------------
+
+function hasMcpServersStackmemKey(configPath: string): boolean {
+  if (!nodeFs.existsSync(configPath)) return false;
+  try {
+    const config = JSON.parse(nodeFs.readFileSync(configPath, "utf-8"));
+    return Boolean(config?.mcpServers?.stackmem);
+  } catch {
+    return false;
+  }
+}
+
+function hasContextServersStackmemKey(configPath: string): boolean {
+  if (!nodeFs.existsSync(configPath)) return false;
+  try {
+    const config = JSON.parse(nodeFs.readFileSync(configPath, "utf-8"));
+    return Boolean(config?.context_servers?.stackmem);
+  } catch {
+    return false;
+  }
+}
+
+const EDITOR_STATUS_CHECKS: { name: string; isRegistered: (homeDir: string) => boolean }[] = [
+  { name: "Claude Code", isRegistered: (homeDir) => isMcpRegistered(nodePath.join(homeDir, ".claude.json")) },
+  { name: "Cursor", isRegistered: (homeDir) => hasMcpServersStackmemKey(nodePath.join(homeDir, ".cursor", "mcp.json")) },
+  {
+    name: "Windsurf",
+    isRegistered: (homeDir) =>
+      hasMcpServersStackmemKey(nodePath.join(homeDir, ".codeium", "windsurf", "mcp_config.json")),
+  },
+  {
+    name: "VS Code",
+    isRegistered: (homeDir) => {
+      const dir = findCopilotChatExtensionDir(homeDir);
+      return dir ? hasMcpServersStackmemKey(nodePath.join(dir, "mcp.json")) : false;
+    },
+  },
+  {
+    name: "Zed",
+    isRegistered: (homeDir) => hasContextServersStackmemKey(nodePath.join(homeDir, ".config", "zed", "settings.json")),
+  },
+];
+
+async function cmdStatus(project: string): Promise<void> {
+  const { count: totalCount, error: totalError } = await supabase
+    .from("memories")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project)
+    .eq("resolved", false);
+  if (totalError) fail(`Failed to load memory count: ${totalError.message}`);
+
+  const { count: pinnedCount, error: pinnedError } = await supabase
+    .from("memories")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project)
+    .eq("resolved", false)
+    .eq("pinned", true);
+  if (pinnedError) fail(`Failed to load pinned count: ${pinnedError.message}`);
+
+  const { count: suggestedCount, error: suggestedError } = await supabase
+    .from("memories")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project)
+    .eq("resolved", false)
+    .eq("suggested", true);
+  if (suggestedError) fail(`Failed to load suggested count: ${suggestedError.message}`);
+
+  const { count: fixesCount, error: fixesError } = await supabase
+    .from("execution_log")
+    .select("id", { count: "exact", head: true })
+    .eq("project", project)
+    .eq("resolved", false);
+  if (fixesError) fail(`Failed to load fixes count: ${fixesError.message}`);
+
+  const { data: lastCaptureRows, error: lastCaptureError } = await supabase
+    .from("memories")
+    .select("content, created_at")
+    .eq("project", project)
+    .order("created_at", { ascending: false })
+    .limit(1);
+  if (lastCaptureError) fail(`Failed to load last capture: ${lastCaptureError.message}`);
+
+  const config = readStackmemConfig();
+  const configPath = nodePath.join(process.cwd(), STACKMEM_CONFIG_FILENAME);
+  let usesCustomBudget = false;
+  if (nodeFs.existsSync(configPath)) {
+    try {
+      const raw = JSON.parse(nodeFs.readFileSync(configPath, "utf-8"));
+      usesCustomBudget = typeof raw.tokenBudget === "number";
+    } catch {
+      // Malformed config — readStackmemConfig already falls back to the
+      // default in this case too, so "default" is the accurate label.
+    }
+  }
+
+  const hookOk = isHookExecutable(nodePath.join(process.cwd(), ".git", "hooks", "post-commit"));
+  const mcpOk = isMcpRegistered(getClaudeConfigPath());
+  const backendOk = await verifyBackendConnection(project);
+
+  const homeDir = nodeOs.homedir();
+  const registeredEditors = EDITOR_STATUS_CHECKS.filter((e) => e.isRegistered(homeDir)).map((e) => e.name);
+
+  console.log(`stackmem status for "${project}"`);
+  console.log("━".repeat(27));
+  console.log(
+    `Memories:     ${totalCount ?? 0} total (${pinnedCount ?? 0} pinned, ${suggestedCount ?? 0} suggested)`
+  );
+  console.log(`Fixes:        ${fixesCount ?? 0} recorded`);
+  console.log(`Token budget: ${config.tokenBudget} (${usesCustomBudget ? "from .stackmem.json" : "default"})`);
+
+  const lastCapture = (lastCaptureRows ?? [])[0];
+  if (lastCapture) {
+    const ago = formatRelativeTime(parseUtcDate(lastCapture.created_at));
+    const snippet =
+      lastCapture.content.length > 50 ? `${lastCapture.content.slice(0, 50)}…` : lastCapture.content;
+    console.log(`Last capture: ${ago} (${snippet})`);
+  } else {
+    console.log("Last capture: none yet");
+  }
+
+  console.log(`Hook:         ${hookOk ? "✓ installed" : "✗ not installed"}`);
+  console.log(`MCP:          ${mcpOk ? "✓ registered" : "✗ not registered"}`);
+  console.log(`Backend:      ${backendOk ? "✓ connected" : "✗ not connected"}`);
+  console.log(
+    `Editors:      ${
+      registeredEditors.length > 0 ? registeredEditors.map((name) => `${name} ✓`).join("  ") : "(none registered)"
+    }`
+  );
 }
 
 async function cmdDoctor(fix: boolean) {
@@ -2843,10 +3671,14 @@ async function main() {
 
   switch (command) {
     case "start": {
-      const split = splitOptionalProject(args, 0);
+      const hookIndex = args.indexOf("--hook");
+      const hookMode = hookIndex !== -1;
+      const positional = hookMode ? [...args.slice(0, hookIndex), ...args.slice(hookIndex + 1)] : args;
+
+      const split = splitOptionalProject(positional, 0);
       if (!split) usage();
       const project = requireProject(split.project);
-      await cmdStart(project);
+      await cmdStart(project, hookMode);
       break;
     }
     case "save": {
@@ -2962,6 +3794,21 @@ async function main() {
       await cmdUnpin(project, memoryId);
       break;
     }
+    case "review": {
+      const split = splitProjectFromVariadic(args);
+      if (split.rest.length > 0) usage();
+      const project = requireProject(split.project);
+      await cmdReview(project);
+      break;
+    }
+    case "edit": {
+      const split = splitOptionalProject(args, 1);
+      if (!split) usage();
+      const project = requireProject(split.project);
+      const [memoryId] = split.rest;
+      await cmdEdit(project, memoryId);
+      break;
+    }
     case "delete": {
       const split = splitOptionalProject(args, 1);
       if (!split) usage();
@@ -3002,6 +3849,29 @@ async function main() {
       await cmdLink();
       break;
     }
+    case "open": {
+      const split = splitProjectFromVariadic(args);
+      if (split.rest.length > 0) usage();
+      const project = requireProject(split.project);
+      await cmdOpen(project);
+      break;
+    }
+    case "purge": {
+      const allIndex = args.indexOf("--all");
+      const isAll = allIndex !== -1;
+      const withoutAllFlag = isAll ? [...args.slice(0, allIndex), ...args.slice(allIndex + 1)] : args;
+
+      const split = splitProjectFromVariadic(withoutAllFlag);
+      if (split.rest.length > 0) usage();
+
+      if (isAll) {
+        await cmdPurgeAll();
+      } else {
+        const project = requireProject(split.project);
+        await cmdPurgeProject(project);
+      }
+      break;
+    }
     case "sync": {
       if (args.length > 0) usage();
       const project = requireProject(null);
@@ -3009,10 +3879,17 @@ async function main() {
       break;
     }
     case "context": {
-      const split = splitProjectFromVariadic(args);
+      const hookIndex = args.indexOf("--hook");
+      const hookMode = hookIndex !== -1;
+      const withoutHookFlag = hookMode ? [...args.slice(0, hookIndex), ...args.slice(hookIndex + 1)] : args;
+
+      const split = splitProjectFromVariadic(withoutHookFlag);
       const project = requireProject(split.project);
-      if (split.rest.length === 0) usage();
-      await cmdContext(project, split.rest.join(" "));
+      // task is optional only in --hook mode (the PreCompact hook has no
+      // user-typed task to pass) — interactive use still requires one.
+      if (split.rest.length === 0 && !hookMode) usage();
+      const task = split.rest.length > 0 ? split.rest.join(" ") : null;
+      await cmdContext(project, task, hookMode);
       break;
     }
     case "why": {
@@ -3029,6 +3906,13 @@ async function main() {
     case "doctor": {
       const fix = args.includes("--fix");
       await cmdDoctor(fix);
+      break;
+    }
+    case "status": {
+      const split = splitProjectFromVariadic(args);
+      if (split.rest.length > 0) usage();
+      const project = requireProject(split.project);
+      await cmdStatus(project);
       break;
     }
     case "undo": {
