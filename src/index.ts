@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { analyzeCodebase, getFileSummary, findDependencies } from "./ast-index.js";
 import { getDeviceId } from "./device.js";
+import { reportError } from "./error-reporting.js";
 import {
   applyContextBudget,
   buildSummaryContent,
@@ -20,6 +21,7 @@ import {
   redactSecrets,
 } from "./scoring.js";
 import { supabase } from "./storage.js";
+import { maybeTrackDailyActive, trackEvent } from "./telemetry.js";
 
 const CONTEXT_BUDGET_TOKENS = 2000;
 const COMPRESSION_THRESHOLD = 20;
@@ -28,6 +30,24 @@ const server = new McpServer({
   name: "coding-memory",
   version: "1.0.0",
 });
+
+// The MCP SDK already converts a thrown error into a graceful
+// isError:true tool result (see node_modules/@modelcontextprotocol/sdk's
+// CallToolRequestSchema handler) — this wrapper sits in front of that,
+// reporting the error (local log, plus remote if telemetry is opted in)
+// before rethrowing unchanged, so the SDK's own handling is untouched.
+function withErrorReporting<Args extends unknown[], R>(
+  handler: (...args: Args) => Promise<R>
+): (...args: Args) => Promise<R> {
+  return async (...args: Args) => {
+    try {
+      return await handler(...args);
+    } catch (error) {
+      await reportError(error);
+      throw error;
+    }
+  };
+}
 
 // --- session_start -----------------------------------------------------
 
@@ -40,7 +60,10 @@ server.registerTool(
       project: z.string().describe("Project identifier"),
     },
   },
-  async ({ project }) => {
+  withErrorReporting(async ({ project }) => {
+    void trackEvent("session_start");
+    void maybeTrackDailyActive();
+
     const { data, error } = await supabase
       .from("memories")
       .select("*")
@@ -149,7 +172,7 @@ server.registerTool(
         },
       },
     };
-  }
+  })
 );
 
 // --- memory compression ----------------------------------------------------
@@ -227,7 +250,7 @@ server.registerTool(
       content: z.string().describe("The memory content to save"),
     },
   },
-  async ({ project, type, content }) => {
+  withErrorReporting(async ({ project, type, content }) => {
     content = redactSecrets(content);
 
     const { data: existingRows, error: existingError } = await supabase
@@ -310,7 +333,7 @@ server.registerTool(
       content: [{ type: "text", text: "Memory saved." }],
       structuredContent: { saved: true, action: "created" },
     };
-  }
+  })
 );
 
 // --- search_past_solutions -------------------------------------------------
@@ -326,7 +349,7 @@ server.registerTool(
       query: z.string().describe("Search query"),
     },
   },
-  async ({ project, query }) => {
+  withErrorReporting(async ({ project, query }) => {
     void query;
 
 
@@ -345,7 +368,7 @@ server.registerTool(
       content: [{ type: "text", text: `Found ${results.length} result(s).` }],
       structuredContent: { results },
     };
-  }
+  })
 );
 
 // --- record_fix ----------------------------------------------------------
@@ -361,7 +384,7 @@ server.registerTool(
       solution: z.string().describe("Description of the solution/fix"),
     },
   },
-  async ({ project, problem, solution }) => {
+  withErrorReporting(async ({ project, problem, solution }) => {
     const { error } = await supabase
       .from("execution_log")
       .insert({ project, problem, solution, resolved: false, device_id: getDeviceId() });
@@ -375,7 +398,7 @@ server.registerTool(
       content: [{ type: "text", text: "Fix recorded." }],
       structuredContent: { saved },
     };
-  }
+  })
 );
 
 // --- analyze_codebase ------------------------------------------------------
@@ -390,7 +413,7 @@ server.registerTool(
       project_path: z.string().describe("Absolute or relative path to the project to index"),
     },
   },
-  async ({ project_path }) => {
+  withErrorReporting(async ({ project_path }) => {
     const summary = analyzeCodebase(project_path);
     return {
       content: [
@@ -401,7 +424,7 @@ server.registerTool(
       ],
       structuredContent: summary,
     };
-  }
+  })
 );
 
 // --- get_file_summary --------------------------------------------------------
@@ -417,7 +440,7 @@ server.registerTool(
       file_name: z.string().describe("File name or relative path to look up"),
     },
   },
-  async ({ project_path, file_name }) => {
+  withErrorReporting(async ({ project_path, file_name }) => {
     const summary = getFileSummary(project_path, file_name);
     return {
       content: [
@@ -428,7 +451,7 @@ server.registerTool(
       ],
       structuredContent: summary,
     };
-  }
+  })
 );
 
 // --- find_dependencies ----------------------------------------------------
@@ -444,7 +467,7 @@ server.registerTool(
       file_name: z.string().describe("File name or relative path to look up"),
     },
   },
-  async ({ project_path, file_name }) => {
+  withErrorReporting(async ({ project_path, file_name }) => {
     const deps = findDependencies(project_path, file_name);
     return {
       content: [
@@ -452,7 +475,7 @@ server.registerTool(
       ],
       structuredContent: deps,
     };
-  }
+  })
 );
 
 // --- session_end -----------------------------------------------------------
@@ -474,7 +497,7 @@ server.registerTool(
       summary: z.string().optional().describe("One sentence describing what was accomplished"),
     },
   },
-  async ({ project, files_touched, errors_encountered, approaches_tried, summary }) => {
+  withErrorReporting(async ({ project, files_touched, errors_encountered, approaches_tried, summary }) => {
     let memoriesSaved = 0;
     let errorsLogged = 0;
 
@@ -535,7 +558,7 @@ server.registerTool(
         message,
       },
     };
-  }
+  })
 );
 
 // --- transport -------------------------------------------------------------
@@ -545,6 +568,23 @@ async function main() {
   await server.connect(transport);
   console.error("coding-memory MCP server running on stdio");
 }
+
+// Deliberately doesn't process.exit() here, unlike cli.ts's equivalent
+// handlers — this is a long-lived server process (one per Claude Code
+// session), and killing it over a single stray async error would drop
+// every subsequent tool call for the rest of the session. Report and
+// keep running; each registered tool's own withErrorReporting wrapper
+// already covers the errors that matter most (thrown inside a handler).
+process.on("uncaughtException", (error) => {
+  void reportError(error).finally(() => {
+    console.error("Uncaught exception in coding-memory MCP server:", error);
+  });
+});
+process.on("unhandledRejection", (reason) => {
+  void reportError(reason).finally(() => {
+    console.error("Unhandled rejection in coding-memory MCP server:", reason);
+  });
+});
 
 main().catch((error) => {
   console.error("Fatal error starting coding-memory MCP server:", error);

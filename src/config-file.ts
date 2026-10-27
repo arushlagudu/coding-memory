@@ -9,6 +9,12 @@ export interface StackmemConfig {
   decayLambda: number;
   captureTypes: string[];
   minQualityScore: number;
+  localOnly: boolean;
+  // When false, hook-captured memories skip the suggested-review queue
+  // and are permanent immediately — see cmdSave's `source === "hook"`
+  // suggested-flag logic in src/cli.ts. Set by `cm init --wizard`'s
+  // "Enable suggested memory review?" prompt.
+  suggestedReview: boolean;
 }
 
 export const DEFAULT_STACKMEM_CONFIG: StackmemConfig = {
@@ -17,6 +23,8 @@ export const DEFAULT_STACKMEM_CONFIG: StackmemConfig = {
   decayLambda: 0.05,
   captureTypes: ["decision", "constraint", "discovery", "rejection"],
   minQualityScore: 0.3,
+  localOnly: false,
+  suggestedReview: true,
 };
 
 function isStringArray(value: unknown): value is string[] {
@@ -44,6 +52,9 @@ function mergeWithDefaults(parsed: unknown): StackmemConfig {
       typeof raw.minQualityScore === "number"
         ? raw.minQualityScore
         : DEFAULT_STACKMEM_CONFIG.minQualityScore,
+    localOnly: typeof raw.localOnly === "boolean" ? raw.localOnly : DEFAULT_STACKMEM_CONFIG.localOnly,
+    suggestedReview:
+      typeof raw.suggestedReview === "boolean" ? raw.suggestedReview : DEFAULT_STACKMEM_CONFIG.suggestedReview,
   };
 }
 

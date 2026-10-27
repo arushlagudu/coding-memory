@@ -25,12 +25,22 @@
 
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from "./config.js";
-import { getDeviceId } from "./device.js";
+import { getDeviceId, getDeviceToken } from "./device.js";
 
+// x-device-token rotates hourly (see device.ts) — computed via a custom
+// fetch, not a static header, so a long-lived process (the MCP server in
+// src/index.ts runs indefinitely, unlike the CLI's one-shot commands)
+// still sends a fresh token after an hour boundary instead of the one
+// captured at startup.
 const rawSupabase: SupabaseClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   global: {
     headers: {
       "x-device-id": getDeviceId(),
+    },
+    fetch: (url, options = {}) => {
+      const headers = new Headers(options.headers);
+      headers.set("x-device-token", getDeviceToken());
+      return fetch(url, { ...options, headers });
     },
   },
 });
@@ -162,3 +172,60 @@ export const supabase: SupabaseClient = new Proxy(rawSupabase, {
 // stackmem-vault repo. link_codes is RLS-scoped to the same 'x-device-id'
 // header as the policies above, so a device can create and poll only its own
 // codes; the vault reads them with the service-role key.
+
+// --- save-memory edge function (infrastructure only, not wired in) --------
+//
+// supabase/functions/save-memory/index.ts enforces per-device/per-project
+// save limits server-side (the anon key alone can't enforce a limit a
+// client could just skip). Run this migration manually first:
+//
+// CREATE TABLE IF NOT EXISTS rate_limits (
+//   device_id text NOT NULL,
+//   window_start timestamptz NOT NULL,
+//   window_type text NOT NULL, -- 'hour' or 'day'
+//   count integer DEFAULT 0,
+//   PRIMARY KEY (device_id, window_start, window_type)
+// );
+//
+// USE_EDGE_FUNCTION is false — no call site routes through
+// saveMemoryViaEdgeFunction yet. cmdSave/cmdFix/etc. still insert directly.
+// Flip this (and update call sites) only after testing the deployed
+// function directly.
+export const USE_EDGE_FUNCTION = false;
+
+export interface EdgeFunctionResult<T> {
+  data: T | null;
+  error: { message: string } | null;
+}
+
+// Calls the deployed save-memory edge function instead of inserting
+// directly. Throws if USE_EDGE_FUNCTION is false — this is infrastructure
+// a future call site will use, not something that should silently no-op
+// if accidentally invoked before it's actually enabled.
+export async function saveMemoryViaEdgeFunction(
+  payload: Record<string, unknown>
+): Promise<EdgeFunctionResult<Record<string, unknown>>> {
+  if (!USE_EDGE_FUNCTION) {
+    throw new Error("saveMemoryViaEdgeFunction called while USE_EDGE_FUNCTION is false");
+  }
+
+  try {
+    const response = await fetch(`${SUPABASE_URL}/functions/v1/save-memory`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-device-id": getDeviceId(),
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const body = await response.json();
+    if (!response.ok) {
+      return { data: null, error: { message: body?.error ?? `Edge function returned ${response.status}` } };
+    }
+    return { data: body, error: null };
+  } catch (error) {
+    return { data: null, error: { message: error instanceof Error ? error.message : String(error) } };
+  }
+}

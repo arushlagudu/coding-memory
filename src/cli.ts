@@ -7,8 +7,16 @@ import { randomInt } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { createInterface } from "node:readline/promises";
 import { analyzeCodebase } from "./ast-index.js";
-import { VAULT_URL } from "./config.js";
+import { GITHUB_CLIENT_ID, VAULT_URL } from "./config.js";
 import { defaultConfigFileContents, readStackmemConfig, STACKMEM_CONFIG_FILENAME } from "./config-file.js";
+import {
+  localIncrementAccessCounts,
+  localListFixes,
+  localListMemories,
+  localResolveMemory,
+  localSaveFix,
+  localSaveMemory,
+} from "./local-store.js";
 import { getDeviceId } from "./device.js";
 import {
   applyContextBudget,
@@ -29,7 +37,15 @@ import {
   scoreMemoryRelevance,
   tokenize,
 } from "./scoring.js";
+import { reportError } from "./error-reporting.js";
 import { supabase } from "./storage.js";
+import {
+  disableTelemetry,
+  enableTelemetry,
+  isTelemetryEnabled,
+  maybeTrackDailyActive,
+  trackEvent,
+} from "./telemetry.js";
 
 // Checked as early as ESM import hoisting allows — before any command
 // dispatch, config loading, or network call — so an unsupported Node
@@ -72,11 +88,11 @@ const TYPE_LABELS: Record<MemoryType, string> = {
 
 function usage(): never {
   console.error(`Usage:
-  cm start [project] [--hook]
-  cm save [project] <type> <content> [--force]  (type: decision|rejection|constraint|discovery)
-  cm fix [project] <problem> <solution>
+  cm start [project] [--hook] [--local]
+  cm save [project] <type> <content> [--force] [--local]  (type: decision|rejection|constraint|discovery)
+  cm fix [project] <problem> <solution> [--local]
   cm analyze [project] <path>
-  cm search [--project <name>] <query>
+  cm search [--project <name>] <query> [--local]
   cm resolve [project] <memory-id>
   cm pin [project] <memory-id>
   cm unpin [project] <memory-id>
@@ -86,12 +102,14 @@ function usage(): never {
   cm inspect [project] <memory-id>
   cm compress [project]
   cm init <project> <path> [--config]
+  cm init --wizard [path]
   cm uninstall [project] [path]
   cm link
+  cm login
   cm open [--project <name>]
   cm purge [--project <name>] [--all]
   cm sync
-  cm context [--project <name>] <task> [--hook]
+  cm context [--project <name>] <task> [--hook] [--local]
   cm why [--project <name>] <file>
   cm session-end [project] [--summary <text>] [--errors <a,b>] [--files <a,b>] [--approaches <a,b>] [--hook]
   cm doctor [--fix]
@@ -99,6 +117,7 @@ function usage(): never {
   cm undo [project]
   cm export [filename]
   cm import [project] <filename>
+  cm telemetry [--enable] [--disable]
   cm help
 
   [project] is optional if a .stackmem file exists in the current
@@ -117,7 +136,14 @@ function cmdHelp() {
   [project] is optional everywhere below if a .stackmem file exists in
   the current directory (written by 'cm init'). Otherwise pass it explicitly.
 
-  cm start [project] [--hook]
+  --local (on save/fix/start/search/context) reads and writes
+  .coding-memory/local-store.json instead of Supabase — no network
+  calls at all. Prints "(local)" on output so it's never ambiguous
+  which store a result came from. Set "localOnly": true in
+  .stackmem.json to use the local store automatically, with no flag,
+  on every one of these commands.
+
+  cm start [project] [--hook] [--local]
       Load all unresolved memories for a project, sorted by decay
       score and capped at a 2000 token context budget, grouped by
       type (decisions, constraints, discoveries, rejections), with
@@ -125,21 +151,21 @@ function cmdHelp() {
       plain-text output (no ids, scores, or separator lines) for use
       as a Claude Code SessionStart hook command — see cm init.
 
-  cm save [project] <type> <content> [--force]
+  cm save [project] <type> <content> [--force] [--local]
       Save a new memory. <type> is one of: decision, rejection,
       constraint, discovery. Automatically links to related existing
       memories. If the new memory contradicts an existing one, prompts
       to keep the old memory or replace it — pass --force to skip the
       prompt and always replace.
 
-  cm fix [project] <problem> <solution>
+  cm fix [project] <problem> <solution> [--local]
       Record a problem and its solution for future reference.
 
   cm analyze [project] <path>
       Build an AST index (files, functions, classes) for the codebase
       at <path>.
 
-  cm search [--project <name>] <query>
+  cm search [--project <name>] <query> [--local]
       Search saved memories and past fixes for a project matching
       <query>. The whole query is always the full remaining text — use
       --project to search a project other than the one in .stackmem.
@@ -196,6 +222,14 @@ function cmdHelp() {
       tokenBudget, decayLambda, captureTypes, minQualityScore — see
       src/config-file.ts) if one doesn't already exist.
 
+  cm init --wizard [path]
+      Interactive setup: prompts for the project name (detected from
+      package.json or the directory name), which editors you use,
+      whether hook-captured memories should start as suggested
+      (pending 'cm review') or permanent immediately, and whether to
+      create .stackmem.json — then runs the same 'cm init' above with
+      those choices. [path] defaults to the current directory.
+
   cm uninstall [project] [path]
       Remove everything 'cm init' set up at <path> (defaults to the
       current directory): the git post-commit hook (restoring whatever
@@ -213,6 +247,15 @@ function cmdHelp() {
       stackmem-vault.vercel.app/link while signed in. The code is
       single-use and expires after 10 minutes; polling stops when it
       does. Links are per-device, so run this once on each machine.
+
+  cm login
+      Sign in with GitHub via the device flow: prints a one-time code
+      and https://github.com/login/device to open in a browser, then
+      polls until you finish authorizing (or it times out after 10
+      minutes). On success, stores the token and your GitHub username
+      at ~/.stackmem-auth. Separate from 'cm link', which pairs this
+      device with an account in the hosted vault — this is a plain
+      GitHub sign-in with no vault involved.
 
   cm open [--project <name>]
       Open the hosted vault's page for this project in the default
@@ -235,7 +278,7 @@ function cmdHelp() {
       overwriting both files on disk only (never git add/commit).
       Project is read from .stackmem.
 
-  cm context [--project <name>] <task> [--hook]
+  cm context [--project <name>] <task> [--hook] [--local]
       Return only the top 5 memories most relevant to a specific
       task, ranked by a blend of task relevance and decay score,
       as a markdown block capped at a 2000 token budget. Use
@@ -298,6 +341,14 @@ function cmdHelp() {
       produced by 'cm export'. Inserted under the current device_id
       and project; memory_links are skipped and get rebuilt by
       semantic linking the next time cm save runs.
+
+  cm telemetry [--enable] [--disable]
+      Opted out by default — no flag prints whether it's currently
+      enabled or disabled. --enable/--disable turn anonymous usage
+      stats (install, init, session_start, daily_active events —
+      version, OS, Node version; never code, file paths, or memory
+      content) on or off. 'cm init --wizard' asks once during setup;
+      this is how to change your answer later.
 
   cm help
       Show this help message.`);
@@ -414,6 +465,15 @@ function extractValueFlag(args: string[], flag: string): { value: string | null;
   const idx = args.indexOf(flag);
   if (idx === -1 || args[idx + 1] === undefined) return { value: null, rest: args };
   return { value: args[idx + 1], rest: [...args.slice(0, idx), ...args.slice(idx + 2)] };
+}
+
+// --local on cm save/fix/start/search/context, OR .stackmem.json's
+// localOnly: true applying automatically with no flag needed.
+function extractLocalFlag(args: string[]): { localMode: boolean; rest: string[] } {
+  const idx = args.indexOf("--local");
+  const explicitLocal = idx !== -1;
+  const rest = explicitLocal ? [...args.slice(0, idx), ...args.slice(idx + 1)] : args;
+  return { localMode: explicitLocal || readStackmemConfig().localOnly, rest };
 }
 
 // --- cm start ----------------------------------------------------------
@@ -551,7 +611,102 @@ function printStartHookOutput(
   }
 }
 
-async function cmdStart(project: string, hookMode = false) {
+// Mirrors cmdStart's ranking (decay + pinned + task-aware boosts) against
+// local-store.ts instead of Supabase. No memory_links (that table has no
+// local-store equivalent — a display enhancement, not core behavior) and
+// no access_count persistence step is skipped either way for parity.
+async function cmdStartLocal(project: string, hookMode: boolean): Promise<void> {
+  const memories = localListMemories(project);
+  if (memories.length === 0) {
+    if (!hookMode) {
+      console.log(`No memories found for "${project}". (local)`);
+    }
+    return;
+  }
+
+  const branchTokens = getBranchNameTokens();
+  const recentFiles = getRecentlyTouchedFiles();
+  const prTitleTokens = getOpenPrTitleTokens();
+  const config = readStackmemConfig();
+  const tokenBudget = config.tokenBudget;
+
+  const scoredMemories = memories
+    .map((memory) => {
+      let decayScore = computeDecayScore(
+        parseUtcDate(memory.created_at),
+        memory.access_count ?? 0,
+        memory.pinned ?? false,
+        config.decayLambda
+      );
+      const contentTokens = tokenize(memory.content);
+      if (branchTokens && hasTokenOverlap(contentTokens, branchTokens)) decayScore *= BRANCH_NAME_BOOST;
+      if (recentFiles && fileListOverlaps(memory.file_paths, recentFiles)) decayScore *= RECENT_FILES_BOOST;
+      if (prTitleTokens && hasTokenOverlap(contentTokens, prTitleTokens)) decayScore *= PR_TITLE_BOOST;
+      return { ...memory, decay_score: decayScore };
+    })
+    .sort((a, b) => b.decay_score - a.decay_score);
+
+  const budgetedMemories = applyContextBudget(scoredMemories, tokenBudget);
+  const fixes = localListFixes(project).slice(0, 5);
+
+  if (hookMode) {
+    printStartHookOutput(
+      project,
+      budgetedMemories.filter((m) => m.pinned),
+      budgetedMemories.filter((m) => !m.pinned),
+      fixes
+    );
+    localIncrementAccessCounts(budgetedMemories.map((m) => m.id));
+    return;
+  }
+
+  console.log(`Loaded ${scoredMemories.length} memory(ies) for "${project}". (local)\n`);
+
+  const pinnedMemories = budgetedMemories.filter((m) => m.pinned);
+  const unpinnedMemories = budgetedMemories.filter((m) => !m.pinned);
+
+  if (pinnedMemories.length > 0) {
+    console.log(`Pinned (${pinnedMemories.length})`);
+    console.log("-".repeat(11));
+    for (const memory of pinnedMemories) {
+      console.log(`  [${memory.id}] (${memory.type}) ${memory.content}`);
+    }
+    console.log("");
+  }
+
+  for (const type of MEMORY_TYPES) {
+    const group = unpinnedMemories.filter((m) => m.type === type);
+    if (group.length === 0) continue;
+
+    console.log(`${TYPE_LABELS[type]} (${group.length})`);
+    console.log("-".repeat(TYPE_LABELS[type].length + 4));
+    for (const memory of group) {
+      console.log(`  [${memory.id}] (score: ${memory.decay_score.toFixed(2)}) ${memory.content}`);
+    }
+    console.log("");
+  }
+
+  if (fixes.length > 0) {
+    console.log(`Past Fixes (${fixes.length})`);
+    console.log("-".repeat(14));
+    for (const fix of fixes) {
+      console.log(`  Problem: ${fix.problem}`);
+      console.log(`  Solution: ${fix.solution ?? "(pending)"}`);
+      console.log("");
+    }
+  }
+
+  localIncrementAccessCounts(budgetedMemories.map((m) => m.id));
+}
+
+async function cmdStart(project: string, hookMode = false, localMode = false) {
+  void trackEvent("session_start");
+  void maybeTrackDailyActive();
+
+  if (localMode) {
+    return cmdStartLocal(project, hookMode);
+  }
+
   const { data, error } = await supabase
     .from("memories")
     .select("*")
@@ -766,13 +921,54 @@ interface SaveProvenance {
   confidence?: number;
 }
 
+// Reuses decideSaveAction/redactSecrets from scoring.ts unchanged — only
+// the storage layer (local-store.ts vs. supabase) differs from cmdSave.
+// No network calls, no memory_links computation (that's a ranking/display
+// enhancement, not core save behavior — out of scope for a quick local
+// fallback).
+async function cmdSaveLocal(project: string, type: string, content: string): Promise<void> {
+  if (!MEMORY_TYPES.includes(type as MemoryType)) {
+    fail(`Invalid memory type '${type}'. Valid types: decision, constraint, discovery, rejection.`);
+  }
+  if (content.length > 500) {
+    fail(
+      `Memory content too long (${content.length} chars). Keep memories under 500 characters — they should be concise facts, not paragraphs.`
+    );
+  }
+
+  content = redactSecrets(content);
+
+  const existing = localListMemories(project);
+  const decision = decideSaveAction(content, existing);
+
+  if (decision.action === "duplicate") {
+    console.log("Duplicate memory detected — skipping. (local)");
+    return;
+  }
+
+  if (decision.action === "superseded") {
+    localResolveMemory(decision.oldId);
+  }
+
+  const memory = localSaveMemory(project, type, content);
+  if (decision.action === "superseded") {
+    console.log(`Replaced with new memory [${memory.id}]. (local)`);
+  }
+  console.log(`Saved ${type} [${memory.id}] for "${project}". (local)`);
+}
+
 async function cmdSave(
   project: string,
   type: string,
   content: string,
   force = false,
-  provenance: SaveProvenance = {}
+  provenance: SaveProvenance = {},
+  localMode = false
 ) {
+  if (localMode) {
+    return cmdSaveLocal(project, type, content);
+  }
+
   if (!MEMORY_TYPES.includes(type as MemoryType)) {
     fail(`Invalid memory type '${type}'. Valid types: decision, constraint, discovery, rejection.`);
   }
@@ -830,7 +1026,9 @@ async function cmdSave(
     // noisy or wrong — they start as suggested, pending `cm review`, and
     // are excluded from cm start/context/why until promoted. Manual and
     // mcp saves are already user-vetted, so they're permanent immediately.
-    suggested: source === "hook",
+    // readStackmemConfig().suggestedReview (set via `cm init --wizard`)
+    // lets a project opt out of the review queue entirely.
+    suggested: source === "hook" && readStackmemConfig().suggestedReview,
   };
   if (commitSha) insertPayload.commit_sha = commitSha;
   if (filePaths && filePaths.length > 0) insertPayload.file_paths = filePaths;
@@ -969,13 +1167,19 @@ async function cmdCompress(project: string) {
 
 // --- cm fix --------------------------------------------------------------
 
-async function cmdFix(project: string, problem: string, solution: string) {
+async function cmdFix(project: string, problem: string, solution: string, localMode = false) {
   if (problem.trim().length === 0 || solution.trim().length === 0) {
     fail("Problem and solution cannot be empty.");
   }
 
   problem = redactSecrets(problem);
   solution = redactSecrets(solution);
+
+  if (localMode) {
+    localSaveFix(project, problem, solution);
+    console.log(`Fix recorded for "${project}". (local)`);
+    return;
+  }
 
   const { error } = await supabase
     .from("execution_log")
@@ -998,7 +1202,59 @@ async function cmdAnalyze(project: string, path: string) {
 
 // --- cm search -------------------------------------------------------------
 
-async function cmdSearch(project: string, query: string) {
+function printSearchResults(
+  memoryResults: { id: string; type: string; content: string }[],
+  fixResults: { problem: string; solution: string | null }[],
+  suffix: string
+): void {
+  if (memoryResults.length === 0 && fixResults.length === 0) {
+    console.log(`No results found${suffix}`);
+    return;
+  }
+
+  console.log(`Memories (${memoryResults.length})${suffix}`);
+  console.log("-".repeat(11));
+  if (memoryResults.length === 0) {
+    console.log("No results found");
+  } else {
+    for (const memory of memoryResults) {
+      console.log(`  [${memory.id}] (${memory.type}) ${memory.content}`);
+    }
+  }
+  console.log("");
+
+  console.log(`Past Fixes (${fixResults.length})${suffix}`);
+  console.log("-".repeat(14));
+  if (fixResults.length === 0) {
+    console.log("No results found");
+  } else {
+    for (const fix of fixResults) {
+      console.log(`  Problem:  ${fix.problem}`);
+      console.log(`  Solution: ${fix.solution}`);
+      console.log("");
+    }
+  }
+}
+
+// A plain substring search (case-insensitive) against local-store.ts —
+// the SQL ilike wildcard search has no local equivalent, so this is the
+// simplest faithful match.
+function cmdSearchLocal(project: string, query: string): void {
+  const lowerQuery = query.toLowerCase();
+  const memoryResults = localListMemories(project).filter((m) =>
+    m.content.toLowerCase().includes(lowerQuery)
+  );
+  const fixResults = localListFixes(project).filter(
+    (f) => f.problem.toLowerCase().includes(lowerQuery) || (f.solution ?? "").toLowerCase().includes(lowerQuery)
+  );
+  printSearchResults(memoryResults, fixResults, " (local)");
+}
+
+async function cmdSearch(project: string, query: string, localMode = false) {
+  if (localMode) {
+    return cmdSearchLocal(project, query);
+  }
+
   const { data: memories, error: memoriesError } = await supabase
     .from("memories")
     .select("*")
@@ -1168,6 +1424,53 @@ async function editContentInteractively(currentContent: string): Promise<string>
 
 // --- cm review -------------------------------------------------------------
 
+// --- shared: multi-prompt readline over TTY or piped stdin ---------------
+
+interface Prompter {
+  ask(prompt: string): Promise<string>;
+  close(): void;
+}
+
+// Node's readline can't reliably answer multiple sequential
+// rl.question() calls over piped (non-TTY) stdin — all buffered input
+// arrives before the second question is even issued, and the pending
+// question never resolves. A real interactive terminal doesn't hit this
+// (keystrokes arrive one at a time), so only the non-TTY path needs the
+// read-everything-up-front workaround: pre-read every line and hand them
+// out from a queue instead of calling rl.question() again per prompt.
+async function createPrompter(): Promise<Prompter> {
+  if (process.stdin.isTTY) {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    return {
+      ask: (prompt) => rl.question(prompt),
+      close: () => rl.close(),
+    };
+  }
+
+  const raw = await new Promise<string>((resolve) => {
+    let buf = "";
+    process.stdin.setEncoding("utf-8");
+    process.stdin.on("data", (chunk) => (buf += chunk));
+    process.stdin.on("end", () => resolve(buf));
+  });
+  const queued = raw.split("\n");
+
+  return {
+    ask: async (prompt) => {
+      console.log(prompt);
+      return queued.shift() ?? "";
+    },
+    close: () => {},
+  };
+}
+
+async function promptYesNo(prompter: Prompter, question: string, defaultYes: boolean): Promise<boolean> {
+  const suffix = defaultYes ? "(y/n, default y)" : "(y/n, default n)";
+  const answer = (await prompter.ask(`${question} ${suffix}: `)).trim().toLowerCase();
+  if (answer === "") return defaultYes;
+  return answer === "y" || answer === "yes";
+}
+
 async function cmdReview(project: string): Promise<void> {
   const { data, error } = await supabase
     .from("memories")
@@ -1189,28 +1492,14 @@ async function cmdReview(project: string): Promise<void> {
   console.log(`Reviewing ${memories.length} suggested memories for "${project}"`);
   console.log("━".repeat(40));
 
-  // Node's readline can't reliably answer multiple sequential
-  // rl.question() calls over piped (non-TTY) stdin — all buffered input
-  // arrives before the second question is even issued, and it never
-  // resolves. A real interactive terminal doesn't hit this (keystrokes
-  // arrive one at a time), so only the non-TTY path needs the
-  // read-everything-up-front workaround.
-  const rl = process.stdin.isTTY ? createInterface({ input: process.stdin, output: process.stdout }) : null;
-  const pipedAnswers: string[] = rl
-    ? []
-    : (
-        await new Promise<string>((resolve) => {
-          let buf = "";
-          process.stdin.setEncoding("utf-8");
-          process.stdin.on("data", (chunk) => (buf += chunk));
-          process.stdin.on("end", () => resolve(buf));
-        })
-      ).split("\n");
+  const prompter = await createPrompter();
 
+  // A blank answer (real Enter keypress, or piped input running dry) falls
+  // through to the "s"/unrecognized branch below and is counted as
+  // skipped — the for loop is bounded by memories.length either way, so
+  // there's no risk of looping forever on exhausted piped input.
   async function nextAnswer(prompt: string): Promise<string> {
-    if (rl) return (await rl.question(prompt)).trim().toLowerCase();
-    console.log(prompt);
-    return (pipedAnswers.shift() ?? "q").trim().toLowerCase();
+    return (await prompter.ask(prompt)).trim().toLowerCase();
   }
 
   let kept = 0;
@@ -1255,7 +1544,7 @@ async function cmdReview(project: string): Promise<void> {
     }
   }
 
-  rl?.close();
+  prompter.close();
   console.log(`Review complete. Kept ${kept}, dropped ${dropped}, skipped ${skipped}.`);
 }
 
@@ -1942,15 +2231,31 @@ function installHook(hooksDir: string, hookLogicPath: string, hookName: string):
     }
   }
 
-  const chainLine = chainedOriginal
-    ? `"$(dirname "$0")/${hookBackupFilename(hookName)}" "$@"\n`
-    : "";
+  // Git for Windows bundles its own POSIX-ish shell and generally runs a
+  // #!/bin/sh hook fine through it — but per the task's explicit ask,
+  // win32 gets a native .cmd-style wrapper instead, as a belt-and-suspenders
+  // compatibility layer rather than relying on that. Untested on an actual
+  // Windows machine; if the chained original hook isn't itself a Windows
+  // batch/cmd/ps1 script, `call` below won't be able to run it correctly.
+  const isWindows = process.platform === "win32";
 
-  nodeFs.writeFileSync(
-    hookPath,
-    `#!/bin/sh\n${STACKMEM_HOOK_MARKER}\n${chainLine}exec node "${hookLogicPath}" "$@"\n`,
-    "utf-8"
-  );
+  if (isWindows) {
+    const chainLine = chainedOriginal ? `call "%~dp0${hookBackupFilename(hookName)}"\n` : "";
+    nodeFs.writeFileSync(
+      hookPath,
+      `@echo off\r\nREM ${STACKMEM_HOOK_MARKER}\r\n${chainLine}node "${hookLogicPath}" %*\r\n`,
+      "utf-8"
+    );
+  } else {
+    const chainLine = chainedOriginal
+      ? `"$(dirname "$0")/${hookBackupFilename(hookName)}" "$@"\n`
+      : "";
+    nodeFs.writeFileSync(
+      hookPath,
+      `#!/bin/sh\n${STACKMEM_HOOK_MARKER}\n${chainLine}exec node "${hookLogicPath}" "$@"\n`,
+      "utf-8"
+    );
+  }
   nodeFs.chmodSync(hookPath, 0o755);
 
   if (chainedOriginal) {
@@ -2159,6 +2464,7 @@ coverage/
 *cursorrules
 *windsurfrules
 .cursor/rules/stackmem.md
+.coding-memory/local-store.json
 `;
 
 // Returns true if the file was created, false if it already existed
@@ -2592,6 +2898,112 @@ function writeStackmemConfigFile(resolvedPath: string): boolean {
   return true;
 }
 
+// --- cm init --wizard ----------------------------------------------------
+
+const WIZARD_EDITOR_CHOICES = ["Claude Code", "Cursor", "Windsurf", "VS Code", "Zed"] as const;
+
+function detectDefaultProjectName(resolvedPath: string): string {
+  try {
+    const pkg = JSON.parse(nodeFs.readFileSync(nodePath.join(resolvedPath, "package.json"), "utf-8"));
+    if (typeof pkg.name === "string" && pkg.name.trim().length > 0) return pkg.name.trim();
+  } catch {
+    // No package.json, or no "name" field — fall back to the directory name.
+  }
+  return nodePath.basename(resolvedPath);
+}
+
+// --wizard is a separate entry point from the non-interactive cmdInit path
+// on purpose — regression/integration tests exercise plain `cm init`
+// unprompted, and must stay that way. This just collects preferences via
+// readline, then drives the same cmdInit everything else already uses.
+//
+// "Which editors do you use? (space to select)" from the task description
+// is a checkbox-style multi-select, which needs raw keypress handling
+// (arrow keys + space to toggle) that plain readline doesn't provide
+// without pulling in a TUI dependency — this asks for a comma-separated
+// list of numbers instead. Functionally equivalent, just typed instead
+// of toggled.
+async function cmdInitWizard(targetPath: string): Promise<void> {
+  const resolvedPath = nodePath.resolve(targetPath);
+  const prompter = await createPrompter();
+
+  try {
+    console.log("Welcome to stackmem! Let's set up your project.");
+    console.log("");
+
+    const detectedName = detectDefaultProjectName(resolvedPath);
+    const projectAnswer = (
+      await prompter.ask(`Project name [${detectedName}] (press enter to accept, or type a new name): `)
+    ).trim();
+    const project = projectAnswer.length > 0 ? projectAnswer : detectedName;
+
+    console.log("");
+    console.log("Which editors do you use? Enter the numbers, comma-separated (e.g. 1,2):");
+    WIZARD_EDITOR_CHOICES.forEach((name, i) => console.log(`  [${i + 1}] ${name}`));
+    const editorsAnswer = (await prompter.ask("> ")).trim();
+    const selectedEditors = editorsAnswer
+      .split(",")
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => n >= 1 && n <= WIZARD_EDITOR_CHOICES.length)
+      .map((n) => WIZARD_EDITOR_CHOICES[n - 1]);
+
+    console.log("");
+    const suggestedReview = await promptYesNo(
+      prompter,
+      "Enable suggested memory review? Hook captures start as suggested, pending `cm review`, instead of permanent immediately.",
+      true
+    );
+
+    console.log("");
+    const createConfig = await promptYesNo(prompter, "Create .stackmem.json config?", true);
+
+    console.log("");
+    const telemetryOptIn = await promptYesNo(
+      prompter,
+      "Help improve stackmem? Send anonymous usage stats (no code, no memories).",
+      false
+    );
+    if (telemetryOptIn) {
+      enableTelemetry();
+    }
+
+    console.log("");
+    console.log("Setting up stackmem...");
+    console.log("");
+
+    await cmdInit(project, targetPath, createConfig);
+
+    // suggestedReview: false has to persist even if the user declined a
+    // full config file — otherwise their answer is silently discarded.
+    // A full config write already includes it at its chosen value; a
+    // declined one still gets a minimal file with just this field.
+    if (!suggestedReview) {
+      const configPath = nodePath.join(resolvedPath, STACKMEM_CONFIG_FILENAME);
+      if (createConfig) {
+        const config = JSON.parse(nodeFs.readFileSync(configPath, "utf-8"));
+        config.suggestedReview = false;
+        nodeFs.writeFileSync(configPath, JSON.stringify(config, null, 2), "utf-8");
+      } else if (!nodeFs.existsSync(configPath)) {
+        nodeFs.writeFileSync(configPath, JSON.stringify({ suggestedReview: false }, null, 2), "utf-8");
+      }
+    }
+
+    console.log("");
+    console.log("Getting started:");
+    console.log(`  Project: ${project}`);
+    console.log(
+      `  Editors: ${selectedEditors.length > 0 ? selectedEditors.join(", ") : "(none selected — MCP still auto-registers for whichever are actually installed)"}`
+    );
+    console.log(`  Suggested memory review: ${suggestedReview ? "enabled" : "disabled"}`);
+    console.log(`  .stackmem.json: ${createConfig || !suggestedReview ? "written" : "not created"}`);
+    console.log(`  Anonymous usage stats: ${telemetryOptIn ? "enabled" : "disabled"}`);
+    console.log("");
+    console.log(`Run 'cm start ${project}' any time to load what stackmem knows about this project.`);
+  } finally {
+    prompter.close();
+  }
+}
+
 async function cmdInit(project: string, targetPath: string, writeConfig = false): Promise<void> {
   const resolvedPath = nodePath.resolve(targetPath);
   const gitDir = nodePath.join(resolvedPath, ".git");
@@ -2672,6 +3084,8 @@ async function cmdInit(project: string, targetPath: string, writeConfig = false)
   // hook) fires anywhere during init, it must still see whatever project
   // .stackmem pointed to before this run, not the one being initialized now.
   writeProjectFile(project, resolvedPath);
+
+  void trackEvent("init");
 }
 
 // --- cm sync ---------------------------------------------------------------
@@ -2767,6 +3181,102 @@ async function cmdLink() {
   }
 
   console.log("Link code expired. Run cm link again.");
+}
+
+// --- cm login ------------------------------------------------------------
+
+const STACKMEM_AUTH_PATH = nodePath.join(nodeOs.homedir(), ".stackmem-auth");
+const GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code";
+const GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token";
+const LOGIN_POLL_TIMEOUT_MS = 10 * 60 * 1000;
+
+interface GitHubDeviceCodeResponse {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  expires_in: number;
+  interval: number;
+}
+
+interface GitHubAccessTokenResponse {
+  access_token?: string;
+  error?: string;
+  error_description?: string;
+}
+
+// GitHub's OAuth device flow (https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow):
+// 1. POST device/code to get a user_code + verification_uri to show the
+//    user, and a device_code this process polls with.
+// 2. Poll access_token on an interval (GitHub tells us how long) until the
+//    user finishes authorizing in the browser, or it expires.
+// GITHUB_CLIENT_ID (src/config.ts) is a placeholder — no OAuth App is
+// registered yet, so step 1 will fail against the real GitHub API until
+// one is. The flow below is complete and real regardless, so wiring in a
+// genuine client_id later is a one-line change.
+async function cmdLogin(): Promise<void> {
+  const deviceCodeRes = await fetch(GITHUB_DEVICE_CODE_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ client_id: GITHUB_CLIENT_ID }),
+  });
+
+  if (!deviceCodeRes.ok) {
+    fail(`Failed to start GitHub login (${deviceCodeRes.status}): ${await deviceCodeRes.text()}`);
+  }
+
+  const deviceCode = (await deviceCodeRes.json()) as GitHubDeviceCodeResponse;
+  console.log(`Open ${deviceCode.verification_uri} and enter code: ${deviceCode.user_code}`);
+
+  const deadline = Date.now() + Math.min(deviceCode.expires_in * 1000, LOGIN_POLL_TIMEOUT_MS);
+  let pollIntervalMs = Math.max(deviceCode.interval, 5) * 1000;
+
+  while (Date.now() < deadline) {
+    await sleep(pollIntervalMs);
+
+    const tokenRes = await fetch(GITHUB_ACCESS_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        device_code: deviceCode.device_code,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      }),
+    });
+
+    const tokenData = (await tokenRes.json()) as GitHubAccessTokenResponse;
+
+    if (tokenData.access_token) {
+      const userRes = await fetch("https://api.github.com/user", {
+        headers: { Authorization: `Bearer ${tokenData.access_token}`, "User-Agent": "stackmem-cli" },
+      });
+
+      if (!userRes.ok) {
+        fail(`Logged in, but failed to fetch GitHub user info (${userRes.status}).`);
+      }
+
+      const user = (await userRes.json()) as { login: string };
+      nodeFs.writeFileSync(
+        STACKMEM_AUTH_PATH,
+        JSON.stringify({ github_token: tokenData.access_token, github_user: user.login }, null, 2),
+        "utf-8"
+      );
+
+      console.log(`Logged in as @${user.login}`);
+      return;
+    }
+
+    if (tokenData.error === "slow_down") {
+      pollIntervalMs += 5000;
+      continue;
+    }
+    if (tokenData.error === "authorization_pending") {
+      continue;
+    }
+
+    fail(`GitHub login failed: ${tokenData.error_description ?? tokenData.error ?? "unknown error"}`);
+  }
+
+  fail("GitHub login timed out after 10 minutes. Run 'cm login' again.");
 }
 
 // --- cm open -----------------------------------------------------------
@@ -2898,7 +3408,60 @@ const CONTEXT_TOP_N = 5;
 // compaction boundary, just "save the most relevant context" generically
 // — so ranking falls back to decay score alone instead of diluting it
 // with a relevance score computed against an empty string.
-async function cmdContext(project: string, task: string | null, hookMode = false) {
+// Mirrors cmdContext's ranking against local-store.ts.
+function cmdContextLocal(project: string, task: string | null, hookMode: boolean): void {
+  const memories = localListMemories(project);
+  if (memories.length === 0) {
+    if (!hookMode) console.log(`No memories found for "${project}". (local)`);
+    return;
+  }
+
+  const config = readStackmemConfig();
+  const tokenBudget = config.tokenBudget;
+
+  const scoredMemories = memories
+    .map((memory) => {
+      const decayScore = computeDecayScore(
+        parseUtcDate(memory.created_at),
+        memory.access_count ?? 0,
+        memory.pinned ?? false,
+        config.decayLambda
+      );
+      const combinedScore =
+        task == null ? decayScore : scoreMemoryRelevance(memory.content, task) * 0.6 + decayScore * 0.4;
+      return { ...memory, combined_score: combinedScore };
+    })
+    .sort((a, b) => b.combined_score - a.combined_score);
+
+  const topMemories = scoredMemories.slice(0, CONTEXT_TOP_N);
+  const budgetedMemories = applyContextBudget(topMemories, tokenBudget);
+  const tokensUsed = budgetedMemories.reduce((sum, memory) => sum + estimateTokens(memory.content), 0);
+
+  const lines: string[] = [`## Project Context: ${project} (local)`];
+  if (task != null) lines.push(`### Task: ${task}`);
+  lines.push("");
+
+  for (const type of CONTEXT_TYPE_ORDER) {
+    const group = budgetedMemories.filter((memory) => memory.type === type);
+    if (group.length === 0) continue;
+
+    lines.push(`**${TYPE_LABELS[type]}**`);
+    for (const memory of group) {
+      lines.push(`- ${memory.content}`);
+    }
+    lines.push("");
+  }
+
+  if (!hookMode) lines.push(`*(${tokensUsed}/${tokenBudget} tokens used)*`);
+
+  console.log(lines.join("\n"));
+}
+
+async function cmdContext(project: string, task: string | null, hookMode = false, localMode = false) {
+  if (localMode) {
+    return cmdContextLocal(project, task, hookMode);
+  }
+
   const { data, error } = await supabase
     .from("memories")
     .select("*")
@@ -3460,6 +4023,13 @@ async function cmdDoctor(fix: boolean) {
     }
   }
 
+  if (process.platform === "win32") {
+    console.log("");
+    console.log(
+      "Note: on Windows, the git hook is installed as a native .cmd wrapper rather than a #!/bin/sh script. If a pre-existing hook was chained and it isn't itself a .cmd/.bat/.ps1 script, it may not run correctly through the wrapper — check .git/hooks/post-commit if automated captures seem to be missing."
+    );
+  }
+
   console.log("");
   if (issues === 0) {
     console.log("All systems operational.");
@@ -3671,22 +4241,26 @@ async function main() {
 
   switch (command) {
     case "start": {
-      const hookIndex = args.indexOf("--hook");
+      const { localMode, rest: withoutLocal } = extractLocalFlag(args);
+      const hookIndex = withoutLocal.indexOf("--hook");
       const hookMode = hookIndex !== -1;
-      const positional = hookMode ? [...args.slice(0, hookIndex), ...args.slice(hookIndex + 1)] : args;
+      const positional = hookMode
+        ? [...withoutLocal.slice(0, hookIndex), ...withoutLocal.slice(hookIndex + 1)]
+        : withoutLocal;
 
       const split = splitOptionalProject(positional, 0);
       if (!split) usage();
       const project = requireProject(split.project);
-      await cmdStart(project, hookMode);
+      await cmdStart(project, hookMode, localMode);
       break;
     }
     case "save": {
-      const forceIndex = args.indexOf("--force");
+      const { localMode, rest: withoutLocal } = extractLocalFlag(args);
+      const forceIndex = withoutLocal.indexOf("--force");
       const force = forceIndex !== -1;
       let positional = force
-        ? [...args.slice(0, forceIndex), ...args.slice(forceIndex + 1)]
-        : args;
+        ? [...withoutLocal.slice(0, forceIndex), ...withoutLocal.slice(forceIndex + 1)]
+        : withoutLocal;
 
       const commitShaFlag = extractValueFlag(positional, "--commit-sha");
       positional = commitShaFlag.rest;
@@ -3738,7 +4312,7 @@ async function main() {
         provenance.filePaths = filesFlag.value.split(",").map((f) => f.trim()).filter(Boolean);
       }
 
-      await cmdSave(project, type, rest.join(" "), force, provenance);
+      await cmdSave(project, type, rest.join(" "), force, provenance, localMode);
       break;
     }
     case "check-commit": {
@@ -3748,11 +4322,12 @@ async function main() {
       break;
     }
     case "fix": {
-      const split = splitOptionalProject(args, 2);
+      const { localMode, rest: withoutLocal } = extractLocalFlag(args);
+      const split = splitOptionalProject(withoutLocal, 2);
       if (!split) usage();
       const project = requireProject(split.project);
       const [problem, solution] = split.rest;
-      await cmdFix(project, problem, solution);
+      await cmdFix(project, problem, solution, localMode);
       break;
     }
     case "analyze": {
@@ -3764,10 +4339,11 @@ async function main() {
       break;
     }
     case "search": {
-      const split = splitProjectFromVariadic(args);
+      const { localMode, rest: withoutLocal } = extractLocalFlag(args);
+      const split = splitProjectFromVariadic(withoutLocal);
       const project = requireProject(split.project);
       if (split.rest.length === 0) usage();
-      await cmdSearch(project, split.rest.join(" "));
+      await cmdSearch(project, split.rest.join(" "), localMode);
       break;
     }
     case "resolve": {
@@ -3833,6 +4409,13 @@ async function main() {
       break;
     }
     case "init": {
+      const wizardIndex = args.indexOf("--wizard");
+      if (wizardIndex !== -1) {
+        const wizardPositional = [...args.slice(0, wizardIndex), ...args.slice(wizardIndex + 1)];
+        await cmdInitWizard(wizardPositional[0] ?? ".");
+        break;
+      }
+
       const configIndex = args.indexOf("--config");
       const writeConfig = configIndex !== -1;
       const positional = writeConfig
@@ -3847,6 +4430,11 @@ async function main() {
     case "link": {
       if (args.length > 0) usage();
       await cmdLink();
+      break;
+    }
+    case "login": {
+      if (args.length > 0) usage();
+      await cmdLogin();
       break;
     }
     case "open": {
@@ -3879,9 +4467,12 @@ async function main() {
       break;
     }
     case "context": {
-      const hookIndex = args.indexOf("--hook");
+      const { localMode, rest: withoutLocal } = extractLocalFlag(args);
+      const hookIndex = withoutLocal.indexOf("--hook");
       const hookMode = hookIndex !== -1;
-      const withoutHookFlag = hookMode ? [...args.slice(0, hookIndex), ...args.slice(hookIndex + 1)] : args;
+      const withoutHookFlag = hookMode
+        ? [...withoutLocal.slice(0, hookIndex), ...withoutLocal.slice(hookIndex + 1)]
+        : withoutLocal;
 
       const split = splitProjectFromVariadic(withoutHookFlag);
       const project = requireProject(split.project);
@@ -3889,7 +4480,7 @@ async function main() {
       // user-typed task to pass) — interactive use still requires one.
       if (split.rest.length === 0 && !hookMode) usage();
       const task = split.rest.length > 0 ? split.rest.join(" ") : null;
-      await cmdContext(project, task, hookMode);
+      await cmdContext(project, task, hookMode, localMode);
       break;
     }
     case "why": {
@@ -3962,6 +4553,19 @@ async function main() {
       await cmdUninstall(project, resolvedPath);
       break;
     }
+    case "telemetry": {
+      if (args.includes("--enable")) {
+        enableTelemetry();
+        console.log("Telemetry enabled. Anonymous usage stats will be sent (no code, no memories).");
+      } else if (args.includes("--disable")) {
+        disableTelemetry();
+        console.log("Telemetry disabled.");
+      } else {
+        console.log(`Telemetry is currently ${isTelemetryEnabled() ? "enabled" : "disabled"}.`);
+        console.log("Use --enable or --disable to change it.");
+      }
+      break;
+    }
     case "help": {
       cmdHelp();
       break;
@@ -3989,7 +4593,21 @@ function resolveMainModulePath(argvPath: string): string | null {
 const isMainModule =
   process.argv[1] != null && import.meta.url === resolveMainModulePath(process.argv[1]);
 if (isMainModule) {
-  main().catch((error) => {
+  process.on("uncaughtException", (error) => {
+    void reportError(error).finally(() => {
+      console.error(`Error: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    });
+  });
+  process.on("unhandledRejection", (reason) => {
+    void reportError(reason).finally(() => {
+      console.error(`Error: ${reason instanceof Error ? reason.message : String(reason)}`);
+      process.exit(1);
+    });
+  });
+
+  main().catch(async (error) => {
+    await reportError(error);
     fail(error instanceof Error ? error.message : String(error));
   });
 }
