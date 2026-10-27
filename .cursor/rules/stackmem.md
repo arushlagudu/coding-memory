@@ -37,5 +37,5 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>
 - webhook returned 400 → (solution pending)
 
 ---
-*Last updated: 10/25/2026, 8:38:38 PM*
+*Last updated: 10/26/2026, 1:17:00 AM*
 *Run `cm start` for full details with decay scores*
