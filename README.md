@@ -24,8 +24,11 @@ cm init myapp .
 ✓ Git hook installed
 ✓ MCP server registered
 ✓ CLAUDE.md written
+✓ AGENTS.md written
+✓ GEMINI.md written
 ✓ .cursorrules written
 ✓ .windsurfrules written
+✓ .cursor/rules/stackmem.md written
 ✓ Seeded 2 memories from project scan
 ✓ Backend connection verified
 
@@ -41,15 +44,21 @@ Four layers, each feeding the next:
 - **Capture** — a git post-commit hook saves memories automatically on every commit: removed dependencies, new config files, auth-related files, TODOs, schema changes, and the commit message itself when it's substantive. No manual annotation. **97.9% automation rate** across stackmem's own real development history.
 - **Semantic organization** — hybrid containment-trigram scoring deduplicates new memories against existing ones, links related memories bidirectionally, and resolves contradictions ("we switched from X to Y") automatically.
 - **Temporal ranking** — an exponential decay score ranks memories by recency and access frequency, then a 2000-token budget decides what actually gets injected.
-- **Delivery** — an MCP server, an 18-command CLI, and the Memory Vault web dashboard all read from the same store and deliver it back into every new session.
+- **Delivery** — an MCP server, a 30-command CLI, and the Memory Vault web dashboard all read from the same store and deliver it back into every new session.
 
 ## Claude Code (automatic)
 
-`cm init` registers the stackmem MCP server in `~/.claude.json`. Memories load automatically at the start of every session — nothing to configure, nothing to remember to run.
+`cm init` registers the MCP server AND writes three Claude Code hooks to `.claude/settings.json`:
+
+- **SessionStart** — injects memories before every session
+- **Stop** — captures learnings when the session ends
+- **PreCompact** — saves context before compaction
+
+Memories load and save automatically with zero interaction.
 
 ## Cursor and Windsurf (automatic)
 
-`cm init` writes `.cursorrules` and `.windsurfrules` directly from your project's live memories, and the git hook keeps them current — `cm sync` regenerates and commits both files automatically after every push. You never have to remember to refresh them by hand.
+`cm init` writes both `.cursorrules` (legacy) and `.cursor/rules/stackmem.md` (current format). The git hook keeps both current after every commit. No sync commits — files update on disk only.
 
 ```
 # stackmem — project memory (auto-updated)
@@ -66,7 +75,40 @@ Four layers, each feeding the next:
 *Run `cm start` for full details with decay scores*
 ```
 
-## CLI commands (all 18)
+## All editors
+
+`cm init` detects and registers the MCP server for:
+
+- Claude Code (`~/.claude.json`)
+- Cursor (`~/.cursor/mcp.json`)
+- Windsurf (`~/.codeium/windsurf/mcp_config.json`)
+- VS Code Copilot
+- Zed (`~/.config/zed/settings.json`)
+
+Also writes `AGENTS.md` (for Codex CLI) and `GEMINI.md` (for Gemini CLI).
+
+## Automatic session capture
+
+Hook captures start as `suggested` — the agent auto-captured them, you haven't vetted them yet. Run `cm review` to triage: keep, edit, or drop. Or use the vault Inbox tab.
+
+Conventional commits are routed automatically:
+
+- `feat`/`fix`/`refactor` → decision
+- `chore`/`docs`/`style`/`test` → skipped (noise filtered out)
+- `BREAKING CHANGE` → constraint
+
+## Local-only mode
+
+Keep everything on-device — no Supabase:
+
+```
+cm save decision 'use postgres' --local
+cm start --local
+```
+
+Or set `localOnly: true` in `.stackmem.json`.
+
+## CLI commands
 
 | Command | Description |
 |---|---|
@@ -79,21 +121,44 @@ Four layers, each feeding the next:
 | `cm delete [project] <memory-id>` | Delete a memory and any links referencing it. |
 | `cm inspect [project] <memory-id>` | Show a single memory's full detail: type, content, decay score, access count, linked memories, and related fixes. |
 | `cm compress [project]` | Cluster related memories (needs 20+) and collapse clusters of 3+ into a summary memory. |
-| `cm init <project> <path>` | Install the git hook, register the MCP server, seed memories from the project scan, and write `.gitignore`, `CLAUDE.md`, `.cursorrules`, and `.windsurfrules`. |
+| `cm init <project> <path>` | Install the git hook, register the MCP server, seed memories from the project scan, and write `.gitignore`, `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, and `.cursor/rules/stackmem.md`. |
 | `cm sync` | Regenerate `.cursorrules` and `.windsurfrules` from current memories and recent fixes. |
 | `cm context [--project <name>] <task>` | Return the top 5 memories most relevant to a specific task, capped at 2000 tokens. |
 | `cm session-end [project]` | Capture what happened in a session and extract memories, errors, and rejected approaches. |
-| `cm doctor` | Check every integration point — backend, MCP registration, `.stackmem`, git hook, memory count — and report what's broken. |
+| `cm doctor [--fix]` | Check every integration point — backend, MCP registration, `.stackmem`, git hook, memory count — and report what's broken. With `--fix`, repair what it can automatically. |
 | `cm undo [project]` | Delete the most recently saved unresolved memory. |
 | `cm export [filename]` | Export all unresolved memories, fixes, and links to a JSON file. |
 | `cm import [project] <filename>` | Import memories and fixes from a file produced by `cm export`. |
+| `cm why [--project] <file>` | Git blame for decisions — show which memories trace back to a given file. |
+| `cm pin [project] <id>` | Pin a memory so it never decays. |
+| `cm unpin [project] <id>` | Unpin a memory, returning it to normal decay. |
+| `cm review [--project]` | Triage suggested memories captured by hooks: keep, edit, or drop. |
+| `cm edit [project] <id>` | Edit a memory's content in place. |
+| `cm status [--project]` | Show a project health summary. |
+| `cm open [--project]` | Open the Memory Vault for this project in your browser. |
+| `cm purge [project] [--all]` | Delete memories for a project, or everything with `--all`. |
+| `cm link` | Link this device to your vault account. |
+| `cm login` | Authenticate via GitHub. |
+| `cm telemetry [--enable/--disable]` | Opt in or out of anonymous usage stats. |
+| `cm init --wizard` | Interactive, guided setup. |
+| `cm init --config` | Write a `.stackmem.json` config file. |
+| `cm uninstall [project] [path]` | Clean removal — reverses everything `cm init` wrote. |
 | `cm help` | Show the full help message. |
 
 ## The Memory Vault
 
 `stackmem-vault.vercel.app`
 
-Sign in with GitHub. View every project you track, each with its memory count and last activity. Four tabs per project: **Memories** (typed, with decay scores and resolve/delete actions), **Fixes** (problem/solution pairs), **Graph** (a D3.js force-directed view of your actual knowledge network — nodes are memories, edges are semantic links), and **Timeline** (every memory chronologically, including resolved ones). A global search bar queries memories and fixes across every project at once.
+Sign in with GitHub. Six tabs per project:
+
+- **Memories** — with inline editing, bulk actions, filters by type/date, and per-project search
+- **Inbox** — suggested memories to review before they become permanent
+- **Files** — file tree showing which memories came from which files
+- **Fixes** — problem/solution pairs
+- **Graph** — D3.js force-directed knowledge network
+- **Timeline** — full chronological history with GitHub commit links
+
+Global features: settings page with linked devices and danger zone, keyboard shortcuts (`?`), mobile layout, global search.
 
 ## How memory works
 
